@@ -1,0 +1,4 @@
+requests[socks]
+selenium
+fake_useragent
+flask

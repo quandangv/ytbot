@@ -1,29 +1,18 @@
-import concurrent.futures.thread
 import hashlib
 import json
-import logging
 import os
-import platform
-import queue
-import shutil
 import sqlite3
 import subprocess
 import sys
-import zipfile
 import threading
 import traceback
 import requests
 import selenium
-import recordclass
-import fake_headers
-import itertools
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import closing
-from datetime import datetime
-from glob import glob
-from random import choice, choices, randrange, shuffle, uniform, random, randint
-from time import gmtime, sleep, strftime, time
-from selenium.common.exceptions import NoSuchElementException
+import fake_useragent
+import concurrent.futures
+import time
+import random
+import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -31,9 +20,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 import website
 from config import create_config
-
-log = logging.getLogger('werkzeug')
-log.disabled = True
 
 os.system("")
 
@@ -55,49 +41,32 @@ class AtomicCounter:
   def __init__(self, initial=0):
     self.value = initial
     self._lock = threading.Lock()
-
   def increment(self, num=1):
     with self._lock:
       self.value += num
       return self.value
 
-ProxyInfo = recordclass.recordclass('ProxyInfo', 'type url')
-BlacklistEntry = recordclass.recordclass('BlacklistEntry', 'weight time')
-
-print(colors.OKGREEN[0] + """
-
-Yb  dP  dP"Yb  88   88 888888 88   88 88""Yb 888888           
- YbdP  dP   Yb 88   88   88   88   88 88__dP 88__           
-  8P   Yb   dP Y8   8P   88   Y8   8P 88""Yb 88""           
-  dP    YbodP  `YbodP'   88   `YbodP' 88oodP 888888
-
-            Yb  dP 88 88 8888 Yb    dP  88 88888 88""Yb 
-             Yb  dP   88 88__  Yb  db  dP 88__   88__dP 
-              YbdP    88 88""   YbdPYbdP  88""   88"Yb  
-               YP     88 888888  YP  YP   888888 88  Yb 
+print("""
+                     ,----,                                ,----, 
+                   ,/   .`|              ,----..         ,/   .`| 
+                 ,`   .'  :   ,---,.    /   /   \      ,`   .'  : 
+        ,---,  ;    ;     / ,'  .'  \  /   .     :   ;    ;     / 
+       /_ ./|.'___,/    ,',---.' .' | .   /   ;.  \.'___,/    ,'  
+ ,---, |  ' :|    :     | |   |  |: |.   ;   /  ` ;|    :     |   
+/___/ \.  : |;    |.';  ; :   :  :  /;   |  ; \ ; |;    |.';  ;   
+ .  \  \ ,' '`----'  |  | :   |    ; |   :  | ; | '`----'  |  |   
+  \  ;  `  ,'    '   :  ; |   :     \.   |  ' ' ' :    '   :  ;   
+   \  \    '     |   |  ' |   |   . |'   ;  \; /  |    |   |  '   
+    '  \   |     '   :  | '   :  '; | \   \  ',  /     '   :  |   
+     \  ;  ;     ;   |.'  |   |  | ;   ;   :    /      ;   |.'    
+      :  \  \    '---'    |   :   /     \   \ .'       '---'      
+       \  ' ;             |   | ,'       `---`                    
+        `--`              `----'                                  
 """ + colors.ENDC)
-
-print(colors.OKCYAN[0] + """
-       [ GitHub : https://github.com/MShawon/YouTube-Viewer ]
-""" + colors.ENDC)
-
-SCRIPT_VERSION = '1.6.2'
-
-proxy = None
-status = None
-server_running = False
-
-urls = []
-queries = []
-hash_urls = None
-hash_queries = None
-start_time = None
-
 driver_list = []
 view = []
 checked = {}
 console = []
-blacklist = {}
 threads = 0
 over_limit_sleep = 10
 browser_count = AtomicCounter()
@@ -133,81 +102,86 @@ website.database = STAT_DATABASE
 
 class PageLoadError(Exception):
   pass
+class TerminatedError(Exception):
+  pass
 class QueryError(Exception):
   pass
 
-def check_update():
-  api_url = 'https://api.github.com/repos/MShawon/YouTube-Viewer/releases/latest'
-  response = requests.get(api_url, timeout=30)
+class ProxyInfo:
+  def __init__(self, type, url):
+    self.type = type
+    self.url = url
+class BlacklistEntry:
+  def __init__(self, weight, time):
+    self.weight = weight
+    self.time = time
 
-  RELEASE_VERSION = response.json()['tag_name']
-
-  if SCRIPT_VERSION != RELEASE_VERSION:
-    print(styles.BOLD + 'Update Available!!! ' +
-        f'YouTube Viewer version {SCRIPT_VERSION} needs to update to {RELEASE_VERSION} version.' + colors.ENDC)
-
+today = str(datetime.datetime.today().date())
 def init_database():
-  with closing(sqlite3.connect(STAT_DATABASE)) as connection:
-    with closing(connection.cursor()) as cursor:
-      cursor.execute("CREATE TABLE IF NOT EXISTS statistics (date TEXT, hours REAL)")
-      connection.commit()
-  with closing(sqlite3.connect(BLACKLIST_DATABASE)) as connection:
-    with closing(connection.cursor()) as cursor:
-      cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (url TEXT PRIMARY KEY, weight REAL, time REAL)")
-      cursor.execute("SELECT * FROM blacklist")
-      now = time()
-      while True:
-        rows = cursor.fetchmany()
-        if not rows: break
-        for row in rows:
-          blacklist[row[0]] = BlacklistEntry(row[1], row[2])
-      connection.commit()
+  global watch_time
+  cursor = stats_db.cursor()
+  cursor.execute("CREATE TABLE IF NOT EXISTS statistics (date TEXT, hours REAL)")
+  try:
+    cursor.execute("SELECT hours FROM statistics WHERE date = ?", (today,))
+    watch_time = AtomicCounter(cursor.fetchone()[0])
+  except Exception:
+    cursor.execute("INSERT INTO statistics VALUES (?, ?)", (today, 0))
+    watch_time = AtomicCounter(0)
+  stats_db.commit()
 
-_stat_database_lock = threading.Lock()
-def update_watch_time(amount):
-  if amount <= 0:
-    return
-  today = str(datetime.today().date())
-  with _stat_database_lock:
-    with closing(sqlite3.connect(STAT_DATABASE, timeout=threads*10)) as connection:
-      with closing(connection.cursor()) as cursor:
-        try:
-          cursor.execute("SELECT hours FROM statistics WHERE date = ?", (today,))
-          previous = cursor.fetchone()[0]
-          cursor.execute("UPDATE statistics SET hours = ? WHERE date = ?", (previous + amount, today))
-        except Exception:
-          cursor.execute("INSERT INTO statistics VALUES (?, ?)", (today, amount))
-        connection.commit()
-
-def add_blacklist(url, weight):
-  if url in blacklist:
-    entry = blacklist[url]
-    update_blacklist(entry)
-    entry.weight += weight
-  else:
-    blacklist[url] = BlacklistEntry(weight, time())
-
-def ease_blacklist(multiplier=0.8):
-  for entry in blacklist.values(): entry.weight *= multiplier
-
-def update_blacklist(entry):
-  now = time()
-  entry.weight *= blacklist_drop_rate(now - entry.time)
-  entry.time = now
-  return entry.weight
-
-def blacklisted(url, update=True):
-  if url in blacklist:
-    if update:
-      return update_blacklist(blacklist[url]) >= BLACKLIST_THRESHOLD
+class Blacklist:
+  def __init__(self):
+    self.db = sqlite3.connect(BLACKLIST_DATABASE)
+    self.entries = {}
+    self._lock = threading.Lock()
+    cursor = self.db.cursor()
+    cursor.execute("""CREATE TABLE IF NOT EXISTS blacklist
+        (url TEXT PRIMARY KEY, weight REAL, time REAL)""")
+    self.db.commit()
+    cursor.execute("SELECT * FROM blacklist")
+    now = time.time()
+    while True:
+      rows = cursor.fetchmany()
+      if not rows: break
+      for row in rows:
+        self.entries[row[0]] = BlacklistEntry(row[1], row[2])
+  def add(self, url, weight):
+    if url in self.entries:
+      entry = self.entries[url]
+      self.update(entry)
+      entry.weight += weight
     else:
-      return blacklist[url].weight >= BLACKLIST_THRESHOLD
-
-blacklist_drop_rate = lambda duration: (1/BLACKLIST_DROP_PER_HOUR)**(duration/3600)
+      with self._lock:
+        self.entries[url] = BlacklistEntry(weight, time.time())
+  def ease(self, multiplier=0.8):
+    for entry in self.entries.values():
+      entry.weight *= multiplier
+  def update(self, entry):
+    now = time.time()
+    entry.weight *= (1/BLACKLIST_DROP_PER_HOUR)**(now - entry.time/3600)
+    entry.time = now
+    return entry.weight
+  def blocks(self, url, update=True):
+    if url in self.entries:
+      if update:
+        return self.update(self.entries[url]) >= BLACKLIST_THRESHOLD
+      else:
+        return self.entries[url].weight >= BLACKLIST_THRESHOLD
+  def commit(self):
+    cursor = self.db.cursor()
+    with self._lock:
+      for url, entry in self.entries.items():
+        if entry.weight >= MIN_BLACKLIST:
+          cursor.execute("""INSERT INTO blacklist(url, weight, time) VALUES (?1, ?2, ?3)
+              ON CONFLICT(url) DO UPDATE SET weight = ?2, time = ?3""",
+              (url, entry.weight, entry.time))
+        else:
+          cursor.execute("DELETE FROM blacklist WHERE url=?", (url,))
+    self.db.commit()
 
 def combined_log(level, *text_tups):
   if level and not terminated:
-    timestamp = datetime.now().strftime("[%d-%b-%Y %H:%M:%S] ")
+    timestamp = datetime.datetime.now().strftime("[%d-%b-%Y %H:%M:%S] ")
     text_tups = [(colors.NONE, timestamp), *text_tups]
     print(''.join([color[0] + msg for color, msg in text_tups]) + colors.ENDC)
     if api and level == 'html':
@@ -215,9 +189,6 @@ def combined_log(level, *text_tups):
         console.pop(0)
       html = ''.join([f'<span style="color:{key[1]}"> {value} </span>' for key, value in text_tups])
       console.append(html)
-
-def get_traceback(limit=None):
-  return traceback.format_exc(limit=1 if terminated else limit)
 
 def wait_for_video(driver):
   try:
@@ -244,9 +215,9 @@ class Video:
     self.fake_watch = fake_watch
     self.routes = [('url', url) for url in info['urls']] + [('search', kw) for kw in info['searches']]
   def open(self, identifier, driver):
-    route = choice(self.routes)
+    route = random.choice(self.routes)
     if route[0] == 'search':
-      spoof_referer(driver, choice(SEARCH_ENGINES), "https://www.youtube.com/")
+      spoof_referer(driver, random.choice(SEARCH_ENGINES), "https://www.youtube.com/")
       try:
         WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
           (By.CSS_SELECTOR, 'input#search')))
@@ -262,7 +233,7 @@ class Video:
         wait_for_video(driver)
         return
     if route[0] == 'url':
-      spoof_referer(driver, choice(REFERERS), route[1])
+      spoof_referer(driver, random.choice(REFERERS), route[1])
       wait_for_video(driver)
       bypass_consent(identifier, driver)
     else:
@@ -338,29 +309,29 @@ def load_proxy(source, proxy_type):
         add_line(line.strip())
   return [ProxyInfo(proxy_type, url) for url in proxies]
 
-def check_proxy(headers, proxy):
+def check_proxy(useragent, proxy):
   try:
     if category == 'free':
+      headers = {
+        "User-Agent": useragent
+      }
       proxy_dict = {
         "http": f"{proxy.type}://{proxy.url}",
         "https": f"{proxy.type}://{proxy.url}",
       }
       response = requests.get(
         'https://www.youtube.com/', headers=headers, proxies=proxy_dict, timeout=30)
-      return response.status_code != 200
-  except Exception:
-    return True
+      return response.status_code if response.status_code != 200 else None
+  except Exception as e:
+    return e
 
 def get_driver(agent, proxy):
-  ostype = platform.system()
-  if ostype == 'Windows':
+  if os.name == 'nt':
     null_path = 'nul'
-  elif ostype == 'Linux':
-    null_path = '/dev/null'
-  elif ostype == 'Darwin':
+  elif os.name == 'posix':
     null_path = '/dev/null'
   else:
-    raise Exception("Operating systemc not supported")
+    raise Exception("Operating system not supported: " + os.name)
   options = selenium.webdriver.FirefoxOptions()
   options.headless = True
 
@@ -379,7 +350,7 @@ def get_driver(agent, proxy):
     options.set_preference("network.proxy.ssl", proxy_split[0])
     options.set_preference("network.proxy.ssl_port", int(proxy_split[1]))
 
-  sizes = choice(VIEWPORT).split('x')
+  sizes = random.choice(VIEWPORT).split('x')
   options.set_preference("media.volume_scale", "0.01")
   options.set_preference("general.useragent.override", agent)
   options.set_preference("media.default_volume", "0.01")
@@ -410,43 +381,47 @@ def get_driver(agent, proxy):
   options.set_preference("toolkit.telemetry.unified", "false")
   options.set_preference("toolkit.telemetry.updateping.enabled", "false")
   options.set_preference("toolkit.telemetry.shutdownpingsender.enabled", "false")
-  #options.set_preference("webgl.disabled", "true")
+  options.set_preference("webgl.disabled", "false")
   options.set_preference("privacy.firstparty.isolate", "true")
   options.set_preference("security.ssl.enable_false_start", "false")
+  if firefox_path:
+    options.binary = firefox_path
   caps = selenium.webdriver.DesiredCapabilities().FIREFOX
   caps["pageLoadStrategy"] = "eager"
-  driver = selenium.webdriver.Firefox(firefox_binary=firefox_path, options=options, service_log_path=null_path)
+  service = selenium.webdriver.firefox.service.Service(log_path=null_path)
+  driver = selenium.webdriver.Firefox(options=options, service=service)
+  driver_list.append(driver)
   driver.set_window_size(sizes[0], sizes[1])
   return driver
 
 def personalization(driver):
-  search = driver.find_element_by_xpath(
-    f'//button[@aria-label="Turn {choice(["on","off"])} Search customization"]')
+  search = driver.find_element(By.XPATH,
+    f'//button[@aria-label="Turn {random.choice(["on","off"])} Search customization"]')
   driver.execute_script("arguments[0].scrollIntoView();", search)
   search.click()
 
-  history = driver.find_element_by_xpath(
-    f'//button[@aria-label="Turn {choice(["on","off"])} YouTube History"]')
+  history = driver.find_element(By.XPATH,
+    f'//button[@aria-label="Turn {random.choice(["on","off"])} YouTube History"]')
   driver.execute_script("arguments[0].scrollIntoView();", history)
   history.click()
 
-  ad = driver.find_element_by_xpath(
-    f'//button[@aria-label="Turn {choice(["on","off"])} Ad personalization"]')
+  ad = driver.find_element(By.XPATH,
+    f'//button[@aria-label="Turn {random.choice(["on","off"])} Ad personalization"]')
   driver.execute_script("arguments[0].scrollIntoView();", ad)
   ad.click()
 
-  confirm = driver.find_element_by_xpath('//button[@jsname="j6LnYe"]')
+  confirm = driver.find_element(By.XPATH, '//button[@jsname="j6LnYe"]')
   driver.execute_script("arguments[0].scrollIntoView();", confirm)
   confirm.click()
 
 
 def bypass_consent(identifier, driver):
   try:
-    consent = driver.find_element_by_xpath("//button[@jsname='higCR']")
-  except NoSuchElementException:
+    consent = driver.find_element(By.XPATH, "//button[@jsname='higCR']")
+  except selenium.common.exceptions.NoSuchElementException:
     try:
-      consent = driver.find_element_by_xpath("//input[@type='submit' and @value='I agree']")
-    except NoSuchElementException:
+      consent = driver.find_element(By.XPATH, "//input[@type='submit' and @value='I agree']")
+    except selenium.common.exceptions.NoSuchElementException:
       return
   combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Bypassing consent..."))
   driver.execute_script("arguments[0].scrollIntoView();", consent)
@@ -456,20 +431,20 @@ def bypass_consent(identifier, driver):
 
 def bypass_signin(driver):
   for _ in range(10):
-    sleep(2)
+    time.sleep(2)
     try:
-      nothanks = driver.find_element_by_class_name(
+      nothanks = driver.find_element(By.CLASS_NAME,
         "style-scope.yt-button-renderer.style-text.size-small")
       nothanks.click()
-      sleep(1)
-      driver.switch_to.frame(driver.find_element_by_id("iframe"))
-      iagree = driver.find_element_by_id('introAgreeButton')
+      time.sleep(1)
+      driver.switch_to.frame(driver.find_element(By.ID, "iframe"))
+      iagree = driver.find_element(By.ID, 'introAgreeButton')
       iagree.click()
       driver.switch_to.default_content()
     except Exception:
       try:
-        driver.switch_to.frame(driver.find_element_by_id("iframe"))
-        iagree = driver.find_element_by_id('introAgreeButton')
+        driver.switch_to.frame(driver.find_element(By.ID, "iframe"))
+        iagree = driver.find_element(By.ID, 'introAgreeButton')
         iagree.click()
         driver.switch_to.default_content()
       except Exception:
@@ -479,10 +454,10 @@ def bypass_signin(driver):
 def bypass_popup(driver):
   try:
     agree = WebDriverWait(driver, 5).until(EC.visibility_of_element_located(
-      (By.XPATH, '//*[@aria-label="Agree to the use of cookies and other data for the purposes described"]')))
+      (By.XPATH, '//*[@aria-label="Agree to the use of cookies and other data for the purpos.namees described"]')))
     driver.execute_script(
       "arguments[0].scrollIntoView();", agree)
-    sleep(1)
+    time.sleep(1)
     agree.click()
   except Exception:
     pass
@@ -490,11 +465,10 @@ def bypass_popup(driver):
 
 def bypass_other_popups(driver):
   labels = ['Got it', 'Skip trial', 'No thanks', 'Dismiss', 'Not now']
-  shuffle(labels)
-
+  random.shuffle(labels)
   for label in labels:
     try:
-      driver.find_element_by_xpath(f"//*[@id='button' and @aria-label='{label}']").click()
+      driver.find_element(By.XPATH, f"//*[@id='button' and @aria-label='{label}']").click()
     except Exception:
       pass
 
@@ -511,14 +485,14 @@ def skip_stuff(identifier, driver):
       combined_log(log_regular_events, (colors.OKBLUE, identifier + "Skipping Ads..."))
       skip_button = WebDriverWait(driver, 20).until(EC.element_to_be_clickable(
           (By.CLASS_NAME, "ytp-ad-skip-button")))
-      sleep(uniform(0.1, 5))
+      time.sleep(random.uniform(0.1, 5))
       skip_button.click()
     except Exception as e:
       combined_log(log_regular_errors, (colors.OKBLUE, identifier + f"Ad skipping exception: {repr(e)}"))
   bypass_other_popups(driver)
 
 def type_keyword(driver, keyword, retry=False):
-  input_keyword = driver.find_element_by_css_selector('input#search')
+  input_keyword = driver.find_element_by_css_selector(By.CSS_SELECTOR, 'input#search')
 
   if retry:
     for _ in range(10):
@@ -526,19 +500,19 @@ def type_keyword(driver, keyword, retry=False):
         input_keyword.click()
         break
       except Exception:
-        sleep(5)
+        time.sleep(5)
         pass
 
   input_keyword.clear()
   for letter in keyword:
     input_keyword.send_keys(letter)
-    sleep(uniform(.1, .4))
+    time.sleep(random.uniform(.1, .4))
 
-  if randrange(2):
+  if random.randrange(2):
     input_keyword.send_keys(Keys.ENTER)
   else:
     try:
-      driver.find_element_by_xpath(
+      driver.find_element(By.XPATH,
         '//*[@id="search-icon-legacy"]').click()
     except Exception:
       driver.execute_script(
@@ -553,18 +527,18 @@ def find_video(driver, videos):
       container = driver
     for video in videos:
       try:
-        video_element = container.find_element_by_xpath(f'//*[@title="{video.title}"]')
-      except NoSuchElementException:
+        video_element = container.find_element(By.XPATH, f'//*[@title="{video.title}"]')
+      except selenium.common.exceptions.NoSuchElementException:
         continue
       driver.execute_script("arguments[0].scrollIntoView();", video_element)
-      sleep(1)
+      time.sleep(1)
       bypass_popup(driver)
       try:
         video_element.click()
       except Exception:
         driver.execute_script("arguments[0].click();", video_element)
       return video
-    sleep(2)
+    time.sleep(2)
     WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.TAG_NAME, 'body'))).send_keys(Keys.CONTROL, Keys.END)
 
@@ -581,14 +555,14 @@ def search_video(driver, keyword, videos):
 
 def play_video(driver):
   try:
-    driver.find_element_by_css_selector('[title^="Pause (k)"]')
+    driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Pause (k)"]')
   except Exception:
     try:
-      driver.find_element_by_css_selector(
+      driver.find_element_by_css_selector(By.CSS_SELECTOR,
         'button.ytp-large-play-button.ytp-button').send_keys(Keys.ENTER)
     except Exception:
       try:
-        driver.find_element_by_css_selector(
+        driver.find_element_by_css_selector(By.CSS_SELECTOR,
           '[title^="Play (k)"]').click()
       except Exception:
         try:
@@ -599,11 +573,11 @@ def play_video(driver):
 
 def play_music(driver):
   try:
-    driver.find_element_by_xpath(
+    driver.find_element(By.XPATH,
       '//*[@id="play-pause-button" and @title="Pause"]')
   except Exception:
     try:
-      driver.find_element_by_xpath(
+      driver.find_element(By.XPATH,
         '//*[@id="play-pause-button" and @title="Play"]').click()
     except Exception:
       driver.execute_script(
@@ -624,11 +598,13 @@ def play(identifier, driver, fake_watch = False):
       (By.XPATH, '//span[@class="view-count style-scope ytd-video-view-count-renderer"]'))).text
 
   if fake_watch:
-    sleep(uniform(5, 10))
+    time.sleep(random.uniform(5, 10))
   elif 'watching' in view_stat:
     error = 0
     while True:
-      view_stat = driver.find_element_by_xpath(
+      if terminated:
+        raise TerminatedError()
+      view_stat = driver.find_element(By.XPATH,
         '//span[@class="view-count style-scope ytd-video-view-count-renderer"]').text
       if 'watching' in view_stat:
         combined_log(log_regular_events, (colors.OKGREEN, identifier + "Stream found, "), (colors.OKCYAN, f"{view_stat} "))
@@ -638,8 +614,8 @@ def play(identifier, driver, fake_watch = False):
       random_command(driver)
       if error == 5:
         break
-      sleep(60)
-      update_watch_time(60/3600)
+      time.sleep(60)
+      watch_time.increment(60/3600)
     return
   else:
     try:
@@ -648,24 +624,26 @@ def play(identifier, driver, fake_watch = False):
       while video_len == 0:
         video_len = driver.execute_script(
           "return document.getElementById('movie_player').getDuration()")
-      video_len = video_len*uniform(minimum, maximum)
+      video_len = video_len*random.uniform(minimum, maximum)
 
-      duration = strftime("%Hh:%Mm:%Ss", gmtime(video_len))
+      duration = str(datetime.timedelta(seconds=video_len))
       combined_log(log_regular_events, (colors.OKGREEN, identifier + f"{content_type} found, Watch Duration : {duration} "))
     except Exception:
-      combined_log('html', (colors.FAIL, identifier + "Suppressed exception before playing: {get_traceback()}"))
+      combined_log('html', (colors.FAIL, identifier + "Suppressed exception before playing: {traceback.format_exc()}"))
 
     update_interval = 5
     update_counter = 1
     prev_time = 0
     for _ in range(round(video_len/2)):
-      sleep(uniform(0.1, 10))
+      if terminated:
+        raise TerminatedError()
+      time.sleep(random.uniform(0.1, 10))
       current_time = driver.execute_script(
         "return document.getElementById('movie_player').getCurrentTime()")
       if update_counter % update_interval:
         update_counter += 1
       elif database:
-        update_watch_time((current_time - prev_time)/3600)
+        watch_time.increment((current_time - prev_time)/3600)
         prev_time = current_time
       if content_type == 'Video':
         play_video(driver)
@@ -674,17 +652,17 @@ def play(identifier, driver, fake_watch = False):
         play_music(driver)
       if current_time > video_len or driver.current_url != current_url:
         break
-  if randrange(2):
-    driver.find_element_by_id('movie_player').send_keys('k')
+  if random.randrange(2):
+    driver.find_element(By.ID, 'movie_player').send_keys('k')
 
 def save_bandwidth(driver):
   try:
-    driver.find_element_by_css_selector(
+    driver.find_element_by_css_selector(By.CSS_SELECTOR,
       "button.ytp-button.ytp-settings-button").click()
-    driver.find_element_by_xpath(
+    driver.find_element(By.XPATH,
       "//div[contains(text(),'Quality')]").click()
 
-    random_quality = choice(['144p', '240p', '360p'])
+    random_quality = random.choice(['144p', '240p', '360p'])
     quality = WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
       (By.XPATH, f"//span[contains(string(),'{random_quality}')]")))
     driver.execute_script(
@@ -693,7 +671,7 @@ def save_bandwidth(driver):
 
   except Exception:
     try:
-      driver.find_element_by_xpath(
+      driver.find_element(By.XPATH,
         '//*[@id="container"]/h1/yt-formatted-string').click()
     except Exception:
       pass
@@ -701,67 +679,68 @@ def save_bandwidth(driver):
 
 def change_playback_speed(driver):
   if playback_speed == 2:
-    driver.find_element_by_id('movie_player').send_keys('<'*randrange(3) + 1)
+    driver.find_element(By.ID, 'movie_player').send_keys('<'*random.randrange(3) + 1)
   elif playback_speed == 3:
-    driver.find_element_by_id('movie_player').send_keys('>'*randrange(3) + 1)
+    driver.find_element(By.ID, 'movie_player').send_keys('>'*random.randrange(3) + 1)
 
 
 def random_command(driver):
   bypass_other_popups(driver)
-  option = choices([1, 2], cum_weights=(0.7, 1.00), k=1)[0]
+  option = random.choices([1, 2], cum_weights=(0.7, 1.00), k=1)[0]
   if option == 2:
-    command = choice(COMMANDS)
+    command = random.choice(COMMANDS)
     if command in ['m', 't', 'c']:
-      driver.find_element_by_id('movie_player').send_keys(command)
+      driver.find_element(By.ID, 'movie_player').send_keys(command)
     elif command == 'k':
-      if randrange(2):
-        driver.find_element_by_id('movie_player').send_keys(command)
+      if random.randrange(2):
+        driver.find_element(By.ID, 'movie_player').send_keys(command)
       driver.execute_script(
-        f'document.querySelector("#comments"){choices(["scrollIntoView", "scrollIntoView"])}();')
-      sleep(uniform(4, 10))
+        f'document.querySelector("#comments"){random.choices(["scrollIntoView", "scrollIntoView"])}();')
+      time.sleep(random.uniform(4, 10))
       driver.execute_script(
         'document.querySelector("#movie_player").scrollIntoView();')
     else:
-      driver.find_element_by_id('movie_player').send_keys(command*(randrange(5)+1))
+      driver.find_element(By.ID, 'movie_player').send_keys(command*(random.randrange(5)+1))
 
 def quit_driver(driver):
   driver_list.remove(driver)
   driver.quit()
 
-def view_thread(identifier, proxy, videos):
+def view_thread(identifier, proxy):
   try:
     videos.detect_changes()
-    headers = fake_headers.Headers(headers=True).generate()
+    useragent = useragents.random
     if browser_count.value < needed_browsers() and video_player_count.value < max_video_players:
-      if check_proxy(headers, proxy):
-        add_blacklist(proxy.url, BAD_PROXY_WEIGHT)
+      result = check_proxy(useragent, proxy)
+      if result:
+        blacklist.add(proxy.url, BAD_PROXY_WEIGHT)
+        #combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> Bad proxy: {result}"))
         combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> Bad proxy"))
-        return True
+        return
     else:
       combined_log(log_reached_limit, (colors.OKBLUE, identifier + f"Reached browser count limit"))
-      sleep(over_limit_sleep)
+      time.sleep(over_limit_sleep)
       return
 
     if browser_count.value < needed_browsers() and not terminated:
       combined_log(log_proxy_events, (colors.OKGREEN, identifier + f"{proxy.type} --> Good Proxy, Opening a new driver"))
-      driver = get_driver(headers['User-Agent'], proxy)
-      driver_list.append(driver)
+      driver = get_driver(useragent, proxy)
       try:
         browser_count.increment()
-        sleep(2)
+        time.sleep(2)
         for _ in range(4):
-          current = choice(videos.all_videos)
+          current = random.choice(videos.all_videos)
           current.open(identifier, driver)
           if video_player_count.value < max_video_players:
             try:
               video_player_count.increment()
               skip_stuff(identifier, driver)
               play(identifier, driver, current.fake_watch)
-              for idx in range(randint(3, 5)):
+              for idx in range(random.randint(3, 5)):
                 next = find_video(driver, videos.targeted_videos)
                 if not next:
                   combined_log('html', (colors.FAIL, identifier + f"Can't find a recommended video from {current.title}, opening a new one"))
-                  current = choice(videos.targeted_videos)
+                  current = random.choice(videos.targeted_videos)
                   current.open(identifier, driver)
                 else:
                   combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Jumped '{current.title}' --> '{next.title}'"))
@@ -771,70 +750,51 @@ def view_thread(identifier, proxy, videos):
             finally:
               video_player_count.increment(-1)
           else:
+            combined_log(log_reached_limit, (colors.OKBLUE, identifier + f"Reached video player limit"))
+            time.sleep(over_limit_sleep)
             break
-        else:
-          combined_log(log_reached_limit, (colors.OKBLUE, identifier + f"Reached video player limit"))
-          sleep(over_limit_sleep)
-          return
         combined_log(log_regular_events, (colors.OKBLUE, identifier + "Closing video player"))
       except PageLoadError:
-        add_blacklist(proxy.url, SLOW_PROXY_WEIGHT)
+        blacklist.add(proxy.url, SLOW_PROXY_WEIGHT)
         combined_log(log_regular_errors, (colors.FAIL, identifier + f"Can't load YouTube! Slow internet speed or Stuck at recaptcha"))
-        return True
+        return
       except selenium.common.exceptions.WebDriverException:
-        add_blacklist(proxy.url, SLOW_PROXY_WEIGHT)
-        combined_log(log_regular_errors, (colors.FAIL, identifier + f"WebDriverException: {get_traceback(2)}"))
-        return True
+        blacklist.add(proxy.url, SLOW_PROXY_WEIGHT)
+        combined_log(log_regular_errors, (colors.FAIL, identifier + f"WebDriverException: {traceback.format_exc()}"))
+        return
       except Exception:
-        combined_log(log_regular_errors, (colors.FAIL, identifier + f"Watch loop exception : {get_traceback()}"))
+        combined_log('html', (colors.FAIL, identifier + f"Watch loop exception : {traceback.format_exc()}"))
       finally:
         quit_driver(driver)
         browser_count.increment(-1)
+  except TerminatedError:
+    print(f"{identifier}terminated")
   except Exception:
-    combined_log(log_regular_errors, (colors.FAIL, identifier + f"Main viewer : {get_traceback()}"))
+    combined_log('html', (colors.FAIL, identifier + f"Main viewer : {traceback.format_exc()}"))
   finally:
-    if not terminated:
-      spawn_view_thread()
+    spawn_view_thread()
 
-def exception_wrapper(msg, func, *args):
+def thread_wrapper(msg, func, *args):
   try:
     func(*args)
   except Exception:
-    combined_log('html', (colors.FAIL, f"{msg}: {get_traceback()}"))
-
-def start_server():
-  global server_running
-  if api and not server_running:
-    server_running = True
-    website.start_server(host=host, port=port)
+    combined_log('html', (colors.FAIL, f"{msg} error: {traceback.format_exc()}"))
+  if terminated:
+    print(f"{msg} exited")
 
 def check_monitored_files():
   while not terminated:
-    sleep(FILE_CHECK_PERIOD)
+    time.sleep(FILE_CHECK_PERIOD)
 
 def clean_exit(executor):
   try:
-    with closing(sqlite3.connect(BLACKLIST_DATABASE, timeout=threads*10)) as connection:
-      with closing(connection.cursor()) as cursor:
-        for url, entry in blacklist.items():
-          if entry.weight >= MIN_BLACKLIST:
-            cursor.execute("""INSERT INTO blacklist(url, weight, time) VALUES (?1, ?2, ?3)
-                ON CONFLICT(url) DO UPDATE SET weight = ?2, time = ?3""", (url, *entry))
-          else:
-            cursor.execute("DELETE FROM blacklist WHERE url=?", (url,))
-        connection.commit()
-    global terminated
-    terminated = True
-    executor.shutdown(wait=True)
+    requests.post(f'http://127.0.0.1:{port}/shutdown')
+    executor.shutdown(wait=True, cancel_futures=True)
     for driver in driver_list:
       driver.quit()
-    if server_future:
-      print('Trying to stop the server')
-      server_future = None
-      server_future.cancel()
-  except:
+  except Exception:
     traceback.print_exc()
-  
+
 def process_cmd(cmd):
   cmd = cmd.lower()
   global max_video_players
@@ -854,17 +814,37 @@ Video player count: {video_player_count.value}/{max_video_players}""")
   elif cmd:
     print(f"Invalid command: {cmd}")
 
+def update_database():
+  global stats_db, blacklist
+  stats_db = sqlite3.connect(STAT_DATABASE)
+  blacklist = Blacklist()
+  try:
+    init_database()
+    while True:
+      time.sleep(10)
+      if terminated:
+        break
+      try:
+        stats_db.execute("UPDATE statistics SET hours = ? WHERE date = ?", (watch_time.value, today))
+        stats_db.commit()
+        blacklist.commit()
+      except Exception:
+        combined_log('html', f"Database update error: {traceback.format_exc()}")
+  finally:
+    stats_db.close()
+    blacklist.db.close()
+
 def periodic_update():
   global proxy_list
   proxy_list = refresh_proxies()
   while True:
-    good_count = sum((1 for proxy in proxy_list if not blacklisted(proxy.url, False)))
+    good_count = sum((1 for proxy in proxy_list if not blacklist.blocks(proxy.url, False)))
     if good_count >= VIEW_THREAD_RESERVE * proxy_thread_count:
       break
-    ease_blacklist()
+    blacklist.ease()
   print(colors.OKCYAN[0] + f'Good proxies : {good_count}' + colors.ENDC)
-  shuffle(videos.targeted_videos)
-  shuffle(videos.all_videos)
+  random.shuffle(videos.targeted_videos)
+  random.shuffle(videos.all_videos)
 
 def main():
   global start_time
@@ -872,20 +852,24 @@ def main():
   global threads
   global futures
   global server_future
+  global cli_future
   global spawn_view_thread
+  global terminated
 
-  start_time = time()
+  start_time = time.time()
   extra_threads = 2 if api else 1
 
-  with ThreadPoolExecutor(max_workers=proxy_thread_count + extra_threads) as executor:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=proxy_thread_count + extra_threads) as executor:
     try:
       def add_thread(msg, func, *args):
-        return executor.submit(exception_wrapper, msg, func, *args)
+        return executor.submit(thread_wrapper, msg, func, *args)
+      add_thread("Database udpate", update_database)
       if api:
-        server_future = add_thread("Web server error", start_server)
+        add_thread("Web server", website.start_server, host, port)
       spawn_lock = threading.Lock()
       current_proxy_idx = 0
       def spawn_view_thread():
+        if terminated: return
         nonlocal current_proxy_idx
         try:
           while True:
@@ -895,10 +879,11 @@ def main():
               idx = current_proxy_idx
               current_proxy_idx = (current_proxy_idx + 1) % len(proxy_list)
             proxy = proxy_list[idx]
+            if terminated: return
             if proxy.type:
-              if not blacklisted(proxy.url):
+              if not blacklist.blocks(proxy.url):
                 identifier = f"Num {idx}".rjust(8) + f" | {proxy.url.center(21)} | "
-                add_thread("Video viewer error", view_thread, identifier, proxy, videos)
+                add_thread(f"Video viewer {idx}", view_thread, identifier, proxy)
                 return
             else:
               combined_log('html', (colors.FAIL, "Proxy type not found"))
@@ -909,18 +894,22 @@ def main():
       while True:
         try:
           process_cmd(input())
-        except KeyboardInterrupt:
-          try:
-            global terminated
-            terminated = True
-            print("INTERRUPT")
-            clean_exit(executor)
-            executor._threads.clear()
-            concurrent.futures.thread._threads_queues.clear()
-          finally:
-            sys.exit()
         except Exception:
-          combined_log('html', (colors.FAIL, f"CLI error: {get_traceback()}"))
+          combined_log('html', (colors.FAIL, f"CLI error: {traceback.format_exc()}"))
+    except KeyboardInterrupt:
+      try:
+        terminated = True
+        print()
+        print("Stopping subprocesses... please wait")
+        clean_exit(executor)
+      except KeyboardInterrupt:
+        print()
+        print("Closing all webdrivers...")
+        for driver in driver_list:
+          driver.quit()
+        driver_list.clear()
+      finally:
+        sys.exit()
     except Exception:
       traceback.print_exc()
 
@@ -936,15 +925,21 @@ def refresh_proxies():
       proxy_list += load_proxy(proxy_conf["socks4_source"], 'socks4')
     if "socks5_source" in proxy_conf:
       proxy_list += load_proxy(proxy_conf["socks5_source"], 'socks5')
-  shuffle(proxy_list)
+  random.shuffle(proxy_list)
   print(colors.OKCYAN[0] + f'Total proxies : {len(proxy_list)}' + colors.ENDC)
   return proxy_list
 
 
 if __name__ == '__main__':
-  check_update()
-  init_database()
   videos = Videos()
+
+  for _ in range(9):
+    try:
+      useragents = fake_useragent.UserAgent()
+      break
+    except Exception: pass
+  else:
+    useragents = fake_useragent.UserAgent()
 
   if os.path.isfile('config.json'):
     with open('config.json', 'r') as openfile:
@@ -974,14 +969,4 @@ if __name__ == '__main__':
   max_video_players = config["video_player_count"]
   over_limit_sleep = proxy_thread_count*OVER_LIMIT_SLEEP_UNIT
 
-  if auth_required and background:
-    print(colors.FAIL[0] +
-        "Premium proxy needs extension to work. Chrome doesn't support extension in Headless mode." + colors.ENDC)
-    input(colors.WARNING[0] +
-        f"Either use proxy without username & password or disable headless mode " + colors.ENDC)
-    sys.exit()
-  while len(view) < views:
-    try:
-      main()
-    except KeyboardInterrupt:
-      sys.exit()
+  main()

@@ -70,6 +70,11 @@ def create_graph_data(dropdown_text):
 
     return graph_data, total, first_date, last_date
 
+def shutdown_server():
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with the Werkzeug Server')
+    func()
 
 def create_dropdown_data():
     dropdown = ['Last 7 days', 'Last 28 days', 'Last 90 days']
