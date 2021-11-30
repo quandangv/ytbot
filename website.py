@@ -1,5 +1,6 @@
 import calendar
 import sqlite3
+import logging
 from contextlib import closing
 from datetime import date, datetime, timedelta
 
@@ -11,7 +12,7 @@ MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
 global console
 console = []
 database = 'stats.db'
-
+logging.getLogger('werkzeug').disabled = True
 
 def create_graph_data(dropdown_text):
     now = datetime.now()

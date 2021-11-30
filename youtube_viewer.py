@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import concurrent.futures
 import time
 import random
 import datetime
+import base64
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -73,21 +75,23 @@ browser_count = AtomicCounter()
 video_player_count = AtomicCounter()
 
 terminated = False
+detailed_proxy_errors = True
 log_reached_limit = False
 log_proxy_events = 'console'
 log_regular_events = 'console'
 log_regular_errors = 'console'
 
-BLACKLIST_DROP_PER_HOUR = 1.5
-BLACKLIST_THRESHOLD = 1
-MIN_BLACKLIST = 0.1
-BAD_PROXY_WEIGHT = 1
-SLOW_PROXY_WEIGHT = 0.5
+COOLDOWN_PER_HOUR = 1.2
+COOLDOWN_THRESHOLD = 1
+MIN_COOLDOWN = 0.1
+BAD_PROXY_COOLDOWN = 1
+SLOW_PROXY_COOLDOWN = 0.5
+WATCH_COOLDOWN = 1
 OVER_LIMIT_SLEEP_UNIT = 4
 VIEW_THREAD_RESERVE = 4
 
 STAT_DATABASE = 'stats.db'
-BLACKLIST_DATABASE = 'proxy_blacklist.db'
+COOLDOWN_DATABASE = 'proxy_cooldowns.db'
 
 VIEWPORT = ['2560x1440', '1920x1080', '1440x900', '1536x864', '1366x768', '1280x1024', '1024x768']
 
@@ -111,7 +115,7 @@ class ProxyInfo:
   def __init__(self, type, url):
     self.type = type
     self.url = url
-class BlacklistEntry:
+class CooldownEntry:
   def __init__(self, weight, time):
     self.weight = weight
     self.time = time
@@ -129,54 +133,52 @@ def init_database():
     watch_time = AtomicCounter(0)
   stats_db.commit()
 
-class Blacklist:
+class Cooldowns:
   def __init__(self):
-    self.db = sqlite3.connect(BLACKLIST_DATABASE)
+    self.db = sqlite3.connect(COOLDOWN_DATABASE)
     self.entries = {}
     self._lock = threading.Lock()
     cursor = self.db.cursor()
-    cursor.execute("""CREATE TABLE IF NOT EXISTS blacklist
+    cursor.execute("""CREATE TABLE IF NOT EXISTS cooldowns
         (url TEXT PRIMARY KEY, weight REAL, time REAL)""")
     self.db.commit()
-    cursor.execute("SELECT * FROM blacklist")
+    cursor.execute("SELECT * FROM cooldowns")
     now = time.time()
     while True:
       rows = cursor.fetchmany()
       if not rows: break
       for row in rows:
-        self.entries[row[0]] = BlacklistEntry(row[1], row[2])
+        self.entries[row[0]] = CooldownEntry(row[1], row[2])
   def add(self, url, weight):
     if url in self.entries:
       entry = self.entries[url]
       self.update(entry)
       entry.weight += weight
+      self.entries[url] = entry
     else:
       with self._lock:
-        self.entries[url] = BlacklistEntry(weight, time.time())
-  def ease(self, multiplier=0.8):
-    for entry in self.entries.values():
-      entry.weight *= multiplier
+        self.entries[url] = CooldownEntry(weight, time.time())
   def update(self, entry):
     now = time.time()
-    entry.weight *= (1/BLACKLIST_DROP_PER_HOUR)**(now - entry.time/3600)
+    entry.weight /= COOLDOWN_PER_HOUR**((now - entry.time)/3600)
     entry.time = now
     return entry.weight
   def blocks(self, url, update=True):
     if url in self.entries:
       if update:
-        return self.update(self.entries[url]) >= BLACKLIST_THRESHOLD
+        return self.update(self.entries[url]) >= COOLDOWN_THRESHOLD
       else:
-        return self.entries[url].weight >= BLACKLIST_THRESHOLD
+        return self.entries[url].weight >= COOLDOWN_THRESHOLD
   def commit(self):
     cursor = self.db.cursor()
     with self._lock:
       for url, entry in self.entries.items():
-        if entry.weight >= MIN_BLACKLIST:
-          cursor.execute("""INSERT INTO blacklist(url, weight, time) VALUES (?1, ?2, ?3)
+        if entry.weight >= MIN_COOLDOWN:
+          cursor.execute("""INSERT INTO cooldowns(url, weight, time) VALUES (?1, ?2, ?3)
               ON CONFLICT(url) DO UPDATE SET weight = ?2, time = ?3""",
               (url, entry.weight, entry.time))
         else:
-          cursor.execute("DELETE FROM blacklist WHERE url=?", (url,))
+          cursor.execute("DELETE FROM cooldowns WHERE url=?", (url,))
     self.db.commit()
 
 def combined_log(level, *text_tups):
@@ -281,7 +283,7 @@ def gather_proxy():
 
   for link in link_list:
     response = requests.get(link)
-    output = response.content.decode()
+    output = response.text
     proxy = output.split('\n')
     proxies += proxy
     print(colors.OKGREEN[0] +
@@ -291,22 +293,54 @@ def gather_proxy():
 def needed_browsers():
   return max(0, browser_ratio * (max_video_players - video_player_count.value) + video_player_count.value)
 
-def load_proxy(source, proxy_type):
-  proxies = []
+def load_proxy(sources, proxy_type):
+  proxies = set()
   def add_line(line):
     if line:
       if line.count(':') == 3:
         split = line.split(':')
         line = f'{split[2]}:{split[-1]}@{split[0]}:{split[1]}'
-      proxies.append(line)
-  if 'http://' in source or 'https://' in source:
-    output = requests.get(source).content.decode()
-    for line in output.split('\r\n' if '\r\n' in output else '\n'):
-      add_line(line)
-  else:
-    with open(source, encoding="utf-8") as fh:
-      for line in fh:
-        add_line(line.strip())
+      proxies.add(line)
+  if not isinstance(sources, list):
+    sources = [sources]
+  for source in sources:
+    if isinstance(source, dict):
+      if isinstance(source['regex'], str):
+        compiled = re.compile(source['regex'], re.DOTALL)
+        if compiled.groups != 2:
+          raise Exception("Proxy regex must contain 2 groups (for host and port)")
+        source['regex'] = compiled
+      urls = source['url']
+      if not isinstance(urls, list):
+        urls = [urls]
+      for url in urls:
+        if isinstance(url, dict):
+          # Selenium doesn't support complicated requests, so we use requests
+          response = requests.request(url.get('method', 'GET'), url['url'],
+              data=url.get('data', None),
+              headers={"User-Agent": useragents.random}
+          )
+          if 'javascript' in url:
+            htmlb64 = base64.b64encode(response.text.encode('utf-8')).decode()
+            scraping_driver.get('data:text/html;base64,' + htmlb64)
+            raw = scraping_driver.page_source
+          else:
+            raw = response.text
+        else:
+          scraping_driver.get(url)
+          raw = scraping_driver.page_source
+        for host, port in source['regex'].findall(raw):
+          proxies.add(f'{host}:{port}')
+        scraping_driver.get('about:blank')
+
+    elif source.startswith('http://') or source.startswith('https://'):
+      lines = requests.get(source).text
+      for line in lines.split('\r\n' if '\r\n' in lines else '\n'):
+        add_line(line)
+    else:
+      with open(source, encoding="utf-8") as fh:
+        for line in fh:
+          add_line(line.strip())
   return [ProxyInfo(proxy_type, url) for url in proxies]
 
 def check_proxy(useragent, proxy):
@@ -325,13 +359,15 @@ def check_proxy(useragent, proxy):
   except Exception as e:
     return e
 
-def get_driver(agent, proxy):
+def get_null_path():
   if os.name == 'nt':
-    null_path = 'nul'
+    return 'nul'
   elif os.name == 'posix':
-    null_path = '/dev/null'
+    return '/dev/null'
   else:
     raise Exception("Operating system not supported: " + os.name)
+def get_driver(agent, proxy):
+  service = selenium.webdriver.firefox.service.Service(log_path=get_null_path())
   options = selenium.webdriver.FirefoxOptions()
   options.headless = True
 
@@ -384,11 +420,10 @@ def get_driver(agent, proxy):
   options.set_preference("webgl.disabled", "false")
   options.set_preference("privacy.firstparty.isolate", "true")
   options.set_preference("security.ssl.enable_false_start", "false")
+  options.accept_insecure_certs = True
+  options.page_load_strategy = 'eager'
   if firefox_path:
     options.binary = firefox_path
-  caps = selenium.webdriver.DesiredCapabilities().FIREFOX
-  caps["pageLoadStrategy"] = "eager"
-  service = selenium.webdriver.firefox.service.Service(log_path=null_path)
   driver = selenium.webdriver.Firefox(options=options, service=service)
   driver_list.append(driver)
   driver.set_window_size(sizes[0], sizes[1])
@@ -583,7 +618,8 @@ def play_music(driver):
       driver.execute_script(
         'document.querySelector("#play-pause-button").click()')
 
-def play(identifier, driver, fake_watch = False):
+def play(identifier, cooldown_url, driver, fake_watch = False):
+  skip_stuff(identifier, driver)
   if "music.youtube.com" in driver.current_url:
     content_type = 'Music'
     play_music(driver)
@@ -616,7 +652,6 @@ def play(identifier, driver, fake_watch = False):
         break
       time.sleep(60)
       watch_time.increment(60/3600)
-    return
   else:
     try:
       current_url = driver.current_url
@@ -654,6 +689,7 @@ def play(identifier, driver, fake_watch = False):
         break
   if random.randrange(2):
     driver.find_element(By.ID, 'movie_player').send_keys('k')
+  cooldowns.add(cooldown_url, WATCH_COOLDOWN)
 
 def save_bandwidth(driver):
   try:
@@ -713,9 +749,8 @@ def view_thread(identifier, proxy):
     if browser_count.value < needed_browsers() and video_player_count.value < max_video_players:
       result = check_proxy(useragent, proxy)
       if result:
-        blacklist.add(proxy.url, BAD_PROXY_WEIGHT)
-        #combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> Bad proxy: {result}"))
-        combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> Bad proxy"))
+        cooldowns.add(proxy.url, BAD_PROXY_COOLDOWN)
+        combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> " + (repr(result) if detailed_proxy_errors else "Bad proxy")))
         return
     else:
       combined_log(log_reached_limit, (colors.OKBLUE, identifier + f"Reached browser count limit"))
@@ -734,8 +769,7 @@ def view_thread(identifier, proxy):
           if video_player_count.value < max_video_players:
             try:
               video_player_count.increment()
-              skip_stuff(identifier, driver)
-              play(identifier, driver, current.fake_watch)
+              play(identifier, proxy.url, driver, current.fake_watch)
               for idx in range(random.randint(3, 5)):
                 next = find_video(driver, videos.targeted_videos)
                 if not next:
@@ -745,8 +779,7 @@ def view_thread(identifier, proxy):
                 else:
                   combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Jumped '{current.title}' --> '{next.title}'"))
                   current = next
-                skip_stuff(identifier, driver)
-                play(identifier, driver, current.fake_watch)
+                play(identifier, proxy.url, driver, current.fake_watch)
             finally:
               video_player_count.increment(-1)
           else:
@@ -755,11 +788,11 @@ def view_thread(identifier, proxy):
             break
         combined_log(log_regular_events, (colors.OKBLUE, identifier + "Closing video player"))
       except PageLoadError:
-        blacklist.add(proxy.url, SLOW_PROXY_WEIGHT)
+        cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
         combined_log(log_regular_errors, (colors.FAIL, identifier + f"Can't load YouTube! Slow internet speed or Stuck at recaptcha"))
         return
       except selenium.common.exceptions.WebDriverException:
-        blacklist.add(proxy.url, SLOW_PROXY_WEIGHT)
+        cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
         combined_log(log_regular_errors, (colors.FAIL, identifier + f"WebDriverException: {traceback.format_exc()}"))
         return
       except Exception:
@@ -790,6 +823,7 @@ def clean_exit(executor):
   try:
     requests.post(f'http://127.0.0.1:{port}/shutdown')
     executor.shutdown(wait=True, cancel_futures=True)
+    print('Shutting down drivers')
     for driver in driver_list:
       driver.quit()
   except Exception:
@@ -798,6 +832,7 @@ def clean_exit(executor):
 def process_cmd(cmd):
   cmd = cmd.lower()
   global max_video_players
+  global detailed_proxy_errors
   if cmd in ['status', 's']:
     print(rf"""Browser count: {browser_count.value}
 Video player count: {video_player_count.value}/{max_video_players}""")
@@ -811,13 +846,15 @@ Video player count: {video_player_count.value}/{max_video_players}""")
     elif cmd[0] != '?':
       print("Invalid operator: {cmd[0]}")
     print(f"Max video players: {max_video_players}")
+  elif cmd[1:] in ['proxy errors', 'proxy_errors', 'pe']:
+    detailed_proxy_errors = cmd[0] == '+'
   elif cmd:
     print(f"Invalid command: {cmd}")
 
 def update_database():
-  global stats_db, blacklist
+  global stats_db, cooldowns
   stats_db = sqlite3.connect(STAT_DATABASE)
-  blacklist = Blacklist()
+  cooldowns = Cooldowns()
   try:
     init_database()
     while True:
@@ -827,40 +864,52 @@ def update_database():
       try:
         stats_db.execute("UPDATE statistics SET hours = ? WHERE date = ?", (watch_time.value, today))
         stats_db.commit()
-        blacklist.commit()
+        cooldowns.commit()
       except Exception:
-        combined_log('html', f"Database update error: {traceback.format_exc()}")
+        combined_log('html', (colors.FAIL, f"Database update error: {traceback.format_exc()}"))
   finally:
     stats_db.close()
-    blacklist.db.close()
+    cooldowns.db.close()
 
 def periodic_update():
   global proxy_list
   proxy_list = refresh_proxies()
-  while True:
-    good_count = sum((1 for proxy in proxy_list if not blacklist.blocks(proxy.url, False)))
-    if good_count >= VIEW_THREAD_RESERVE * proxy_thread_count:
-      break
-    blacklist.ease()
+  if VIEW_THREAD_RESERVE * proxy_thread_count < len(proxy_list):
+    while True:
+      good_count = sum((1 for proxy in proxy_list if not cooldowns.blocks(proxy.url, False)))
+      if good_count >= VIEW_THREAD_RESERVE * proxy_thread_count:
+        break
+      COOLDOWN_THRESHOLD *= 1.2
+  else:
+    good_count = len(proxy_list)
+    COOLDOWN_THRESHOLD = float('inf')
   print(colors.OKCYAN[0] + f'Good proxies : {good_count}' + colors.ENDC)
   random.shuffle(videos.targeted_videos)
   random.shuffle(videos.all_videos)
 
+def get_scraping_driver():
+  service = selenium.webdriver.firefox.service.Service(log_path=get_null_path())
+  options = selenium.webdriver.FirefoxOptions()
+  options.accept_insecure_certs = True
+  #options.page_load_strategy = 'eager'
+  options.headless = True
+  if firefox_path:
+    options.binary = firefox_path
+  driver = selenium.webdriver.Firefox(options=options, service=service)
+  driver_list.append(driver)
+  return driver
+
 def main():
-  global start_time
-  global proxy_list
-  global threads
-  global futures
-  global server_future
-  global cli_future
   global spawn_view_thread
   global terminated
+  global scraping_driver
 
   start_time = time.time()
   extra_threads = 2 if api else 1
 
   with concurrent.futures.ThreadPoolExecutor(max_workers=proxy_thread_count + extra_threads) as executor:
     try:
+      scraping_driver = get_scraping_driver()
       def add_thread(msg, func, *args):
         return executor.submit(thread_wrapper, msg, func, *args)
       add_thread("Database udpate", update_database)
@@ -876,13 +925,14 @@ def main():
             with spawn_lock:
               if not current_proxy_idx:
                 periodic_update()
+                print("update done")
               idx = current_proxy_idx
               current_proxy_idx = (current_proxy_idx + 1) % len(proxy_list)
             proxy = proxy_list[idx]
             if terminated: return
             if proxy.type:
-              if not blacklist.blocks(proxy.url):
-                identifier = f"Num {idx}".rjust(8) + f" | {proxy.url.center(21)} | "
+              if not cooldowns.blocks(proxy.url):
+                identifier = f"Num {str(idx).rjust(4)} | {proxy.url.center(21)} | "
                 add_thread(f"Video viewer {idx}", view_thread, identifier, proxy)
                 return
             else:
@@ -891,6 +941,7 @@ def main():
           traceback.print_exc()
       for _ in range(VIEW_THREAD_RESERVE * proxy_thread_count):
         spawn_view_thread()
+      print("SPAWNED")
       while True:
         try:
           process_cmd(input())
@@ -912,6 +963,8 @@ def main():
         sys.exit()
     except Exception:
       traceback.print_exc()
+    finally:
+      scraping_driver.quit()
 
 def refresh_proxies():
   proxy_conf = config["proxy"]
@@ -941,10 +994,7 @@ if __name__ == '__main__':
   else:
     useragents = fake_useragent.UserAgent()
 
-  if os.path.isfile('config.json'):
-    with open('config.json', 'r') as openfile:
-      config = json.load(openfile)
-  else:
+  if not os.path.isfile('config.json'):
     create_config()
 
   with open('config.json', 'r') as openfile:
