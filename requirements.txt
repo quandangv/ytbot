@@ -2,3 +2,4 @@ requests[socks]
 selenium
 fake_useragent
 flask
+proxy-checker
