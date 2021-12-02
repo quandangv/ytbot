@@ -54,14 +54,14 @@ colors.FAIL[0]+r"                     ,----,"+colors.OKBLUE[0]+"                
 colors.FAIL[0]+r"                   ,'   .:|"+colors.OKBLUE[0]+"                             ,'   .:|\n" +
 colors.FAIL[0]+r"                 ,`   .::::"+colors.OKBLUE[0]+"  ,---,       ,---,,       ,`   .::::\n" +
 colors.FAIL[0]+r"         ,----,,'   ,::::,'"+colors.OKBLUE[0]+",'  .::\    ,`  ,::::,   ,'   ,::::,'\n" +
-colors.FAIL[0]+r"        /__,;:'___,:::::|"+colors.OKBLUE[0]+",---,':,:::  /   /::::::;.'___,:::::|  \n" +
+colors.FAIL[0]+r"        /__,;:'___,:::::|"+colors.OKBLUE[0]+",---,':_:::  /   /::::::;.'___,:::::|  \n" +
 colors.FAIL[0]+r" ,---,  | |::|    |:::::|"+colors.OKBLUE[0]+"|   |:| |:: :   /::::::::\    ::::::|  \n" +
-colors.FAIL[0]+r":___/:\;  |::|    |:'|::|"+colors.OKBLUE[0]+"|   |:|.:/  '  ;:::/  \:::;   |:'|::|  \n" +
+colors.FAIL[0]+r":___/:\;  |::|    |:'|::|"+colors.OKBLUE[0]+"|   |:|/:/  '  ;:::/  \:::;   |:'|::|  \n" +
 colors.FAIL[0]+r" \  \::\ ,'::;----'  |::|"+colors.OKBLUE[0]+"|   |:::.  ;   |::;',  ;::|---'  |::|  \n" +
 colors.FAIL[0]+r"  \  \::\'::|    |   |::|"+colors.OKBLUE[0]+"|   |::::\ |   |::| |  |::|  |   |::|  \n" +
-colors.FAIL[0]+r"   \  \:::::;    |   |::|"+colors.OKBLUE[0]+"|   |::,:::.   |::| |  |::|  |   |::|  \n" +
+colors.FAIL[0]+r"   \  \:::::;    |   |::|"+colors.OKBLUE[0]+"|   |::_:::.   |::| |  |::|  |   |::|  \n" +
 colors.FAIL[0]+r"    ', ',::|     |   |::|"+colors.OKBLUE[0]+"|   |:| |:|'   ;::;/   ;::;  |   |::|  \n" +
-colors.FAIL[0]+r"     ;  ;::;     |   |.' "+colors.OKBLUE[0]+"|   |:|.::: \   \::',,':::   |   |:'   \n" +
+colors.FAIL[0]+r"     ;  ;::;     |   |.' "+colors.OKBLUE[0]+"|   |:|/::: \   \::',,':::   |   |:'   \n" +
 colors.FAIL[0]+r"    |  |::|      '---'   "+colors.OKBLUE[0]+"|   |:::,'   ;   :::::::;    '---'     \n" +
 colors.FAIL[0]+r"    ;  ;::;              "+colors.OKBLUE[0]+"|   |::'      `,  `::::`               \n" +
 colors.FAIL[0]+r"     `---`               "+colors.OKBLUE[0]+"`----'          `---``                 \n" +
@@ -169,14 +169,21 @@ class Proxies:
 
   def refresh(self):
     self._list = []
+    self._urls = set()
     self._gather()
-    with open('proxies.pyx', 'r') as openfile:
-      # pyx is for Python Expression
-      sources = eval(openfile.read())
+    if os.path.isfile('proxies.pyx'):
+      with open('proxies.pyx', 'r') as openfile:
+        # pyx is for Python Expression
+        sources = eval(openfile.read())
+    else:
+      print(colors.FAIL[0] + "No proxies.pyx found!")
     for source in list_wrap(sources):
       self._load(source)
+    self._urls = None
+    if not self._list:
+      raise Exception("No proxies found!")
     random.shuffle(self._list)
-    print(colors.OKCYAN[0] + f'Total proxies : {len(self._list)}' + colors.ENDC)
+    print(colors.OKCYAN[0] + f'Total proxies: {len(self._list)}' + colors.ENDC)
     global COOLDOWN_THRESHOLD
     if VIEW_THREAD_RESERVE * proxy_thread_count < len(self._list):
       while True:
@@ -191,6 +198,10 @@ class Proxies:
     print(colors.OKCYAN[0] + f'Not blacklisted: {good_count}' + colors.ENDC)
 
   def _load(self, source):
+    def add_list(url, type):
+      if not url in self._urls:
+        self._urls.add(url)
+        self._list.append(ProxyInfo(type, url))
     extract_type = lambda source: source if isinstance(source, tuple) else (source, None)
     if isinstance(source, dict):
       if isinstance(source['regex'], str):
@@ -214,7 +225,7 @@ class Proxies:
           url, type = extract_type(url)
           raw = requests.get(url, headers={"User-Agent": useragents.random}).text
         for host, port in source['regex'].findall(raw):
-          self._list.append(ProxyInfo(type, f'{host}:{port}'))
+          add_list(f'{host}:{port}', type)
       return
     source, type = extract_type(source)
     def add_line(line):
@@ -222,7 +233,7 @@ class Proxies:
         if line.count(':') == 3:
           split = line.split(':')
           line = f'{split[2]}:{split[-1]}@{split[0]}:{split[1]}'
-        self._list.append(ProxyInfo(type, line))
+        add_list(line, type)
     if source.startswith('http://') or source.startswith('https://'):
       lines = requests.get(source).text
       for line in lines.split('\r\n' if '\r\n' in lines else '\n'):
@@ -260,10 +271,10 @@ class Proxies:
         combined_log(log_proxy_events, (colors.FAIL, identifier + f"{proxy.type} --> Bad anonymity: {result.anonymity}"))
         continue
       if not proxy.type:
-        proxy.type = result.protocols[0]
+        proxy.type = result.protocols.pop()
       elif not proxy.type in result.protocols:
         combined_log('html', (colors.FAIL, identifier + f"{proxy.type} --> Wrong protocol, actually {result.protocols}"))
-        proxy.type = result.protocols[0]
+        proxy.type = result.protocols.pop()
       combined_log(log_proxy_events, (colors.OKGREEN, identifier + f"{proxy.type} --> Good Proxy"))
       while browser_count.value >= needed_browsers():
         time.sleep(over_limit_sleep)
@@ -356,10 +367,12 @@ class Video:
     self.id = id
     self.title = info['title']
     self.fake_watch = fake_watch
-    self.routes = [('url', url) for url in info['urls']] + [('search', kw) for kw in info['searches']]
+    self.routes = []
+    for type, arr in info['routes'].items():
+      self.routes += [(type, data) for data in arr ]
   def open(self, identifier, driver):
     route = random.choice(self.routes)
-    if route[0] == 'search':
+    if route[0] == 'yt_search':
       spoof_referer(driver, random.choice(SEARCH_ENGINES), "https://www.youtube.com/")
       try:
         WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
@@ -367,7 +380,7 @@ class Video:
       except selenium.common.exceptions.TimeoutException:
         raise PageLoadError()
       bypass_consent(identifier, driver)
-      if not search_video(driver, route[1], [self]):
+      if not yt_search_video(driver, route[1], [self]):
         combined_log(log_regular_errors, (colors.FAIL, identifier + f"Search not found: {route[1]} :::: {self.title}. Fallback to url"))
         route = self.routes[0]
         if route[0] != 'url':
@@ -396,7 +409,7 @@ class Videos:
       sys.exit()
     self.targeted_videos = [Video(id, info, False) for id, info in video_dict.items()]
     print(colors.OKGREEN[0] + f'{len(self.targeted_videos)} videos loaded' + colors.ENDC)
-    self.all_videos = self.targeted_videos + [Video(id, info, True) for id, info in fake_watch_dict.items()]*3
+    self.all_videos = self.targeted_videos + [Video(id, info, True) for id, info in fake_watch_dict.items()]*jumping_video_boost
   def get_hash(self):
     hash = hashlib.md5()
     with open("videos.json", "rb") as f:
@@ -425,7 +438,7 @@ def get_null_path():
 def get_driver(agent, proxy):
   service = selenium.webdriver.firefox.service.Service(log_path=get_null_path())
   options = selenium.webdriver.FirefoxOptions()
-  options.headless = True
+  options.headless = headless
 
   proxy_split = proxy.url.split(':')
   options.set_preference("network.proxy.type", 1)
@@ -444,6 +457,7 @@ def get_driver(agent, proxy):
 
   sizes = random.choice(VIEWPORT).split('x')
   options.set_preference("media.volume_scale", "0.01")
+  options.set_preference("toolkit.cosmeticAnimations.enabled", "false")
   options.set_preference("general.useragent.override", agent)
   options.set_preference("media.default_volume", "0.01")
   options.set_preference("media.autoplay.default", 0)
@@ -603,8 +617,7 @@ def type_keyword(driver, keyword, retry=False):
     input_keyword.send_keys(Keys.ENTER)
   else:
     try:
-      driver.find_element(By.XPATH,
-        '//*[@id="search-icon-legacy"]').click()
+      driver.find_element(By.XPATH, '//*[@id="search-icon-legacy"]').click()
     except Exception:
       driver.execute_script(
         'document.querySelector("#search-icon-legacy").click()')
@@ -633,7 +646,7 @@ def find_video(driver, videos):
     WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.TAG_NAME, 'body'))).send_keys(Keys.CONTROL, Keys.END)
 
-def search_video(driver, keyword, videos):
+def yt_search_video(driver, keyword, videos):
   try:
     type_keyword(driver, keyword)
   except Exception:
@@ -646,6 +659,10 @@ def search_video(driver, keyword, videos):
 
 def play_video(driver):
   try:
+    try:
+      driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
+    except selenium.common.exceptions.NoSuchElementException:
+      pass
     driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Pause (k)"]')
   except Exception:
     try:
@@ -653,8 +670,7 @@ def play_video(driver):
         'button.ytp-large-play-button.ytp-button').send_keys(Keys.ENTER)
     except Exception:
       try:
-        driver.find_element_by_css_selector(By.CSS_SELECTOR,
-          '[title^="Play (k)"]').click()
+        driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Play (k)"]').click()
       except Exception:
         try:
           driver.execute_script(
@@ -664,12 +680,14 @@ def play_video(driver):
 
 def play_music(driver):
   try:
-    driver.find_element(By.XPATH,
-      '//*[@id="play-pause-button" and @title="Pause"]')
+    try:
+      driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
+    except selenium.common.exceptions.NoSuchElementException:
+      pass
+    driver.find_element(By.XPATH, '//*[@id="play-pause-button" and @title="Pause"]')
   except Exception:
     try:
-      driver.find_element(By.XPATH,
-        '//*[@id="play-pause-button" and @title="Play"]').click()
+      driver.find_element(By.XPATH, '//*[@id="play-pause-button" and @title="Play"]').click()
     except Exception:
       driver.execute_script(
         'document.querySelector("#play-pause-button").click()')
@@ -728,7 +746,7 @@ def play(identifier, cooldown_url, driver, fake_watch = False):
     for _ in range(round(video_len/2)):
       if terminated:
         raise TerminatedError()
-      time.sleep(random.uniform(0.1, 10))
+      time.sleep(random.uniform(10, 20))
       current_time = driver.execute_script(
         "return document.getElementById('movie_player').getCurrentTime()")
       if update_counter % update_interval:
@@ -784,13 +802,16 @@ def random_command(driver):
     if command in ['m', 't', 'c']:
       driver.find_element(By.ID, 'movie_player').send_keys(command)
     elif command == 'k':
-      if random.randrange(2):
+      press = random.randrange(2)
+      if press:
         driver.find_element(By.ID, 'movie_player').send_keys(command)
+      for _ in range(2, 5):
+        driver.execute_script(f'document.querySelector("#comments").scrollBy({random.uniform(300, 700)});')
+        time.sleep(random.uniform(0.5, 3))
       driver.execute_script(
-        f'document.querySelector("#comments"){random.choices(["scrollIntoView", "scrollIntoView"])}();')
-      time.sleep(random.uniform(4, 10))
-      driver.execute_script(
-        'document.querySelector("#movie_player").scrollIntoView();')
+        'document.querySelector("#movie_player").scrollIntoView(true);')
+      if press:
+        driver.find_element(By.ID, 'movie_player').send_keys(command)
     else:
       driver.find_element(By.ID, 'movie_player').send_keys(command*(random.randrange(5)+1))
 
@@ -890,8 +911,6 @@ def update_database():
     init_database()
     while True:
       time.sleep(15)
-      if terminated:
-        break
       try:
         stats_db.execute("UPDATE statistics SET hours = ? WHERE date = ?", (watch_time.value, today))
         stats_db.commit()
@@ -899,6 +918,8 @@ def update_database():
         videos.detect_changes()
       except Exception:
         combined_log('html', (colors.FAIL, f"Database update error: {traceback.format_exc()}"))
+      if terminated:
+        break
   finally:
     stats_db.close()
     cooldowns.db.close()
@@ -912,14 +933,15 @@ def main():
   global terminated
   global add_thread
 
+  def add_thread(msg, func, *args):
+    thread = threading.Thread(target=thread_wrapper, args=(msg, func, *args))
+    thread.start()
+    return thread
+  add_thread("Database udpate", update_database)
+  webserver_thread = api and add_thread("Web server", website.start_server, host, port)
+  for _ in range(proxy_thread_count):
+    add_thread("Proxy checker", proxies.check_proxies)
   try:
-    def add_thread(msg, func, *args):
-      threading.Thread(target=thread_wrapper, args=(msg, func, *args)).start()
-    add_thread("Database udpate", update_database)
-    if api:
-      add_thread("Web server", website.start_server, host, port)
-    for _ in range(proxy_thread_count):
-      add_thread("Proxy checker", proxies.check_proxies)
     while True:
       try:
         process_cmd(input())
@@ -930,7 +952,8 @@ def main():
       terminated = True
       print()
       print("Stopping subprocesses... please wait")
-      requests.post(f'http://127.0.0.1:{port}/shutdown')
+      if webserver_thread and webserver_thread.is_alive():
+        requests.post(f'http://127.0.0.1:{port}/shutdown')
       for driver in driver_list:
         driver.quit()
     except Exception:
@@ -956,9 +979,11 @@ if __name__ == '__main__':
 
   global max_browsers
   api = config["http_api"]["enabled"]
+  jumping_video_boost = config.get("jumping_video_boost", 1)
   host = config["http_api"]["host"]
   port = config["http_api"]["port"]
   database = config["database"]
+  headless = config["headless"]
   filter_anonymity = config["filter_anonymity"]
   firefox_path = config["firefox_path"]
   minimum = config["minimum_percent"] / 100

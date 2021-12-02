@@ -67,7 +67,7 @@ class Checker:
 
   def check_proxy(self, proxy, checked_type=['http', 'socks4', 'socks5'], check_country=True):
     responses = []
-    protocols = []
+    protocols = set()
     elapsed = 0
 
     for protocol in checked_type:
@@ -80,7 +80,7 @@ class Checker:
             proxies={'http': proxy_url, 'https': proxy_url})
         if response.ok:
           responses.append(response.text)
-          protocols.append(protocol)
+          protocols.add(protocol)
           elapsed += response.elapsed.total_seconds()
         elif logging:
           print(f'Got status code {response.status_code}')

@@ -20,8 +20,11 @@ def update_channel_videos(api_key, channel_id, video_dict = {}):
         else:
           video_dict[id] = {
             'title': i['snippet']['title'],
-            'urls': [base_video_url + id],
-            'searches': []
+            'routes': {
+              'url': [base_video_url + id],
+              'yt_search': [],
+              'google_search': [],
+            }
           }
     try:
       next_page_token = resp['nextPageToken']
@@ -44,8 +47,11 @@ def update_video_info(api_key, video_id, video_attrs = None):
     else:
       video_attrs = {
         'title': i['snippet']['title'],
-        'urls': [base_video_url + video_id],
-        'searches': []
+        'routes': {
+          'url': [base_video_url + video_id],
+          'yt_search': [],
+          'google_search': [],
+        }
       }
   return video_attrs
 
