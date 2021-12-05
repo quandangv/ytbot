@@ -484,7 +484,12 @@ class Videos:
     if not video_dict:
       combined_log("html", (colors.FAIL, f"Your videos.json is empty!"))
       sys.exit()
-    targeted_videos = [Video(id, info, False) for id, info in video_dict.items()]
+    targeted_videos = []
+    for id, info in video_dict.items():
+      try:
+        targeted_videos.append(Video(id, info, False))
+      except Exception:
+        print(colors.FAIL[0] + f'Failed to load video {id}: {info}')
     print(colors.OKGREEN[0] + f'{len(targeted_videos)} videos loaded' + colors.ENDC)
     if os.path.isfile('fake_watch_videos.json'):
       with open('fake_watch_videos.json', 'r', encoding='utf-8') as fp:
