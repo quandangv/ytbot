@@ -55,8 +55,8 @@ colors.FAIL[0]+r"                   ,'   .:|"+colors.OKBLUE[0]+"                
 colors.FAIL[0]+r"                 ,`   .::::"+colors.OKBLUE[0]+"  ,---,       ,---,,       ,`   .::::\n" +
 colors.FAIL[0]+r"         ,----,,'   ,::::,'"+colors.OKBLUE[0]+",'  .::\    ,`  ,::::,   ,'   ,::::,'\n" +
 colors.FAIL[0]+r"        /__,;:'___,:::::|"+colors.OKBLUE[0]+",---,':_:::  /   /::::::;.'___,:::::|  \n" +
-colors.FAIL[0]+r" ,---,  | |::|    |:::::|"+colors.OKBLUE[0]+"|   |:| |:: :   /::::::::\    ::::::|  \n" +
-colors.FAIL[0]+r":___/:\;  |::|    |:'|::|"+colors.OKBLUE[0]+"|   |:|/:/  '  ;:::/  \:::;   |:'|::|  \n" +
+colors.FAIL[0]+r" ,---,  | |::|    |:::::|"+colors.OKBLUE[0]+"|   |:| |:: /   /::::::::\    ::::::|  \n" +
+colors.FAIL[0]+r":___/:\;  |::|    |:'|::|"+colors.OKBLUE[0]+"|   |:|/:/ ;   ;:::/  \:::;   |:'|::|  \n" +
 colors.FAIL[0]+r" \  \::\ ,'::;----'  |::|"+colors.OKBLUE[0]+"|   |:::.  ;   |::;',  ;::|---'  |::|  \n" +
 colors.FAIL[0]+r"  \  \::\'::|    |   |::|"+colors.OKBLUE[0]+"|   |::::\ |   |::| |  |::|  |   |::|  \n" +
 colors.FAIL[0]+r"   \  \:::::;    |   |::|"+colors.OKBLUE[0]+"|   |::_:::.   |::| |  |::|  |   |::|  \n" +
@@ -66,6 +66,7 @@ colors.FAIL[0]+r"    |  |::|      '---'   "+colors.OKBLUE[0]+"|   |:::,'   ;   :
 colors.FAIL[0]+r"    ;  ;::;              "+colors.OKBLUE[0]+"|   |::'      `,  `::::`               \n" +
 colors.FAIL[0]+r"     `---`               "+colors.OKBLUE[0]+"`----'          `---``                 \n" +
 colors.ENDC)
+
 driver_list = []
 view = []
 checked = {}
@@ -102,29 +103,54 @@ SEARCH_ENGINES = ['https://search.yahoo.com/', 'https://duckduckgo.com/', 'https
       'https://www.bing.com/']
 REFERERS = SEARCH_ENGINES + ['https://t.co/', '']
 
+GOOGLE_LINK_TEMPLATE = "https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=video&cd=&url={url}"
+YOUTUBE_LINK_TEMPLATE = "https://www.youtube.com/watch?v={id}"
+YOUTU_BE_LINK_TEMPLATE = "https://youtu.be/{id}"
+
 COMMANDS = [Keys.UP, Keys.DOWN, 'k', 'j', 'l', 't', 'c']
 
 website.console = console
 website.database = STAT_DATABASE
 
-class PageLoadError(Exception):
-  pass
-class TerminatedError(Exception):
-  pass
-class QueryError(Exception):
-  pass
+class LoadingError(Exception): pass
+class FirstActionError(LoadingError): pass
+class FirstPageError(FirstActionError): pass
+class TerminatedError(Exception): pass
+
+def first_page_wrap(driver, url):
+  try:
+    driver.get(url)
+  except (selenium.common.exceptions.TimeoutException, selenium.common.exceptions.WebDriverException):
+    try:
+      driver.get(url)
+    except (selenium.common.exceptions.TimeoutException, selenium.common.exceptions.WebDriverException):
+      raise FirstPageError()
+
+def first_action_wrap(driver, condition):
+  try:
+    return WebDriverWait(driver, 30).until(condition)
+    driver.get(url)
+  except (selenium.common.exceptions.TimeoutException):
+    raise FirstActionError()
 
 today = str(datetime.datetime.today().date())
 def init_database():
   global watch_time
+  global og_watch_time
+  global views
+  global og_views
   cursor = stats_db.cursor()
-  cursor.execute("CREATE TABLE IF NOT EXISTS statistics (date TEXT, hours REAL)")
+  cursor.execute("CREATE TABLE IF NOT EXISTS statistics (date TEXT, hours REAL, views INTEGER)")
   try:
-    cursor.execute("SELECT hours FROM statistics WHERE date = ?", (today,))
+    cursor.execute("SELECT hours, views FROM statistics WHERE date = ?", (today,))
     watch_time = AtomicCounter(cursor.fetchone()[0])
+    views = AtomicCounter(cursor.fetchone()[1])
   except Exception:
-    cursor.execute("INSERT INTO statistics VALUES (?, ?)", (today, 0))
+    cursor.execute("INSERT INTO statistics VALUES (?, ?, ?)", (today, 0, 0))
     watch_time = AtomicCounter(0)
+    views = AtomicCounter(0)
+  og_watch_time = watch_time.value
+  og_views = views.value
   stats_db.commit()
 
 list_wrap = lambda item: item if isinstance(item, list) else [item]
@@ -151,7 +177,6 @@ class Proxies:
     service = selenium.webdriver.firefox.service.Service(log_path=get_null_path())
     options = selenium.webdriver.FirefoxOptions()
     options.accept_insecure_certs = True
-    #options.page_load_strategy = 'eager'
     options.headless = True
     if firefox_path:
       options.binary = firefox_path
@@ -258,6 +283,7 @@ class Proxies:
       identifier = f"Num {str(idx).rjust(4)} | {proxy.url.center(21)} | "
       if cooldowns.blocks(proxy.url):
         continue
+      if terminated: return
       result = self.checker.check_proxy(proxy.url,
           checked_type = proxy_check_order[proxy.type] if recheck_proxy else [proxy.type],
           check_country = False)
@@ -276,6 +302,7 @@ class Proxies:
         combined_log('html', (colors.FAIL, identifier + f"{proxy.type} --> Wrong protocol, actually {result.protocols}"))
         proxy.type = result.protocols.pop()
       combined_log(log_proxy_events, (colors.OKGREEN, identifier + f"{proxy.type} --> Good Proxy"))
+      if terminated: return
       while browser_count.value >= needed_browsers():
         time.sleep(over_limit_sleep)
         if terminated: return
@@ -346,83 +373,147 @@ def combined_log(level, *text_tups):
 
 def wait_for_video(driver):
   try:
-    WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
+    WebDriverWait(driver, 100).until(EC.visibility_of_element_located(
       (By.XPATH, '//ytd-player[@id="ytd-player"]')))
   except selenium.common.exceptions.TimeoutException:
-    raise PageLoadError()
+    raise LoadingError("Youtube video player failed to load")
 
 def spoof_referer(driver, referer, url):
-  try:
-    if referer:
-      driver.get(referer)
-      driver.execute_script(
-        "window.location.href = '{}';".format(url))
+  if referer:
+    first_page_wrap(driver, referer)
+    driver.execute_script(
+      "window.location.href = '{}';".format(url))
+  else:
+    first_page_wrap(driver, url)
+
+def get_fallback_links(video_id):
+  return [ YOUTU_BE_LINK_TEMPLATE.format(id=video_id), YOUTUBE_LINK_TEMPLATE.format(id=video_id) ]
+
+class RouteRecord:
+  CONNECTION_FAILURE = 2
+  TYPE_FAILURE = 1.2
+  DATA_FAILURE = 1.1
+  FAILURE = 1
+  SUCCESS = 0
+  def __init__(self, first_record_type, first_data=None):
+    self.type_failures = [0, 0, 0]
+    self.data_failures = {}
+    self.add_record(first_record_type, first_data)
+  def __str__(self):
+    format_record = lambda record: f'S{record[self.SUCCESS]}-C{record[self.CONNECTION_FAILURE]}-F{record[self.FAILURE]}'
+    data_str = ', '.join(f'{data}: {format_record(ratio)}' for data, ratio in self.data_failures.items())
+    return f'RouteRecord({format_record(self.type_failures)}, {{{data_str}}})'
+  def add_record(self, record_type, data=None):
+    if record_type == self.TYPE_FAILURE:
+      self.type_failures[self.FAILURE] += 1
+    elif record_type == self.CONNECTION_FAILURE:
+      self.type_failures[self.CONNECTION_FAILURE] += 1
     else:
-      driver.get(url)
-  except (selenium.common.exceptions.TimeoutException, selenium.common.exceptions.WebDriverException):
-    raise PageLoadError()
+      if not data in self.data_failures:
+        self.data_failures[data] = [0, 0, 0]
+      if record_type == self.SUCCESS:
+        self.type_failures[self.SUCCESS] += 1
+        self.data_failures[data][self.SUCCESS] += 1
+      elif record_type == self.DATA_FAILURE:
+        self.data_failures[data][self.FAILURE] += 1
 
 class Video:
   def __init__(self, id, info, fake_watch):
     self.id = id
     self.title = info['title']
+    self.alt_titles = info.get('alt_titles', [])
     self.fake_watch = fake_watch
     self.routes = []
     for type, arr in info['routes'].items():
-      self.routes += [(type, data) for data in arr ]
+      self.routes += [(type, data) for data in arr ] * (search_boost if 'search' in type else 1)
+    for link in get_fallback_links(self.id):
+      self.routes.append(('url', link))
+      #self.routes.append(('url', GOOGLE_LINK_TEMPLATE.format(url=link)))
   def open(self, identifier, driver):
-    route = random.choice(self.routes)
-    if route[0] == 'yt_search':
-      spoof_referer(driver, random.choice(SEARCH_ENGINES), "https://www.youtube.com/")
-      try:
-        WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
-          (By.CSS_SELECTOR, 'input#search')))
-      except selenium.common.exceptions.TimeoutException:
-        raise PageLoadError()
-      bypass_consent(identifier, driver)
-      if not yt_search_video(driver, route[1], [self]):
-        combined_log(log_regular_errors, (colors.FAIL, identifier + f"Search not found: {route[1]} :::: {self.title}. Fallback to url"))
-        route = self.routes[0]
-        if route[0] != 'url':
-          raise Exception("Can't find a url for video")
+    while True:
+      route = random.choice(self.routes)
+      if 'search' in route[0]:
+        try:
+          if route[0] == 'bing_search':
+            result = bing_search(driver, route[1], videos.targeted_videos)
+          elif route[0] == 'duck_search':
+            result = duck_search(driver, route[1], videos.targeted_videos)
+          elif route[0] == 'yt_search':
+            result = yt_search(driver, route[1], videos.targeted_videos)
+          else:
+            raise Exception(f"Invalid route type: {route[0]}")
+          if result:
+            wait_for_video(driver)
+            bypass_consent(driver)
+            videos.add_route_record(route[0], RouteRecord.SUCCESS, route[1])
+            return
+        except Exception as e:
+          if isinstance(e, LoadingError):
+            videos.add_route_record(route[0], RouteRecord.CONNECTION_FAILURE)
+            raise e
+          else:
+            videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
+            combined_log('html', (colors.FAIL, identifier + f"Error during {route[0]}: {traceback.format_exc()}"))
+        else:
+          combined_log('html', (colors.FAIL, identifier + f"{route[0]} failed: {route[1]} :::: {self.title}. Fallback to url"))
+          videos.add_route_record(route[0], RouteRecord.DATA_FAILURE, route[1])
+        continue
+      if route[0] == 'url':
+        try:
+          spoof_referer(driver, random.choice(REFERERS), route[1])
+          bypass_unsupported_browser(driver)
+          wait_for_video(driver)
+          bypass_consent(driver)
+          videos.add_route_record(route[0], RouteRecord.SUCCESS, route[1])
+          return
+        except Exception as e:
+          videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
+          raise e
       else:
-        wait_for_video(driver)
-        return
-    if route[0] == 'url':
-      spoof_referer(driver, random.choice(REFERERS), route[1])
-      wait_for_video(driver)
-      bypass_consent(identifier, driver)
-    else:
-      raise Exception("Invalid route type: " + route[0])
+        raise Exception("Invalid route type: " + route[0])
 
 class Videos:
   def __init__(self):
-    self.load()
+    self.targeted_videos, self.all_videos = self.load()
     self.hash = self.get_hash()
-  def load(self):
+    self.route_records = {}
+  @staticmethod
+  def load():
     with open('videos.json', 'r', encoding='utf-8') as fp:
       video_dict = json.load(fp)
-    with open('fake_watch_videos.json', 'r', encoding='utf-8') as fp:
-      fake_watch_dict = json.load(fp)
     if not video_dict:
       combined_log("html", (colors.FAIL, f"Your videos.json is empty!"))
       sys.exit()
-    self.targeted_videos = [Video(id, info, False) for id, info in video_dict.items()]
-    print(colors.OKGREEN[0] + f'{len(self.targeted_videos)} videos loaded' + colors.ENDC)
-    self.all_videos = self.targeted_videos + [Video(id, info, True) for id, info in fake_watch_dict.items()]*jumping_video_boost
+    targeted_videos = [Video(id, info, False) for id, info in video_dict.items()]
+    print(colors.OKGREEN[0] + f'{len(targeted_videos)} videos loaded' + colors.ENDC)
+    if os.path.isfile('fake_watch_videos.json'):
+      with open('fake_watch_videos.json', 'r', encoding='utf-8') as fp:
+        all_videos = targeted_videos + [Video(id, info, True) for id, info in json.load(fp).items()]*jumping_video_boost
+    else:
+      all_videos = targeted_videos
+    return targeted_videos, all_videos
   def get_hash(self):
     hash = hashlib.md5()
     with open("videos.json", "rb") as f:
       hash.update(f.read())
-    with open("fake_watch_videos.json", "rb") as f:
-      hash.update(f.read())
+    if os.path.isfile('fake_watch_videos.json'):
+      with open("fake_watch_videos.json", "rb") as f:
+        hash.update(f.read())
     return hash.hexdigest()
   def detect_changes(self):
     new_hash = self.get_hash()
     if new_hash != self.hash:
       print("Reloading videos...")
-      self.load()
-      self.hash = new_hash
+      try:
+        self.targeted_videos, self.all_videos = self.load()
+        self.hash = new_hash
+      except:
+        traceback.print_exc()
+  def add_route_record(self, route_type, record_type, route_data=None):
+    if not route_type in self.route_records:
+      self.route_records[route_type] = RouteRecord(record_type, route_data)
+    else:
+      self.route_records[route_type].add_record(record_type, route_data)
 
 def needed_browsers():
   return max(0, browser_ratio * (max_video_players - video_player_count.value) + video_player_count.value)
@@ -456,10 +547,10 @@ def get_driver(agent, proxy):
     options.set_preference("network.proxy.ssl_port", int(proxy_split[1]))
 
   sizes = random.choice(VIEWPORT).split('x')
-  options.set_preference("media.volume_scale", "0.01")
+  options.set_preference("media.volume_scale", "0.001")
   options.set_preference("toolkit.cosmeticAnimations.enabled", "false")
   options.set_preference("general.useragent.override", agent)
-  options.set_preference("media.default_volume", "0.01")
+  options.set_preference("media.default_volume", "0.001")
   options.set_preference("media.autoplay.default", 0)
   options.set_preference("browser.cache.disk.enable", "false")
   options.set_preference("browser.cache.disk_cache_ssl", "false")
@@ -491,7 +582,6 @@ def get_driver(agent, proxy):
   options.set_preference("privacy.firstparty.isolate", "true")
   options.set_preference("security.ssl.enable_false_start", "false")
   options.accept_insecure_certs = True
-  options.page_load_strategy = 'eager'
   if firefox_path:
     options.binary = firefox_path
   driver = selenium.webdriver.Firefox(options=options, service=service)
@@ -499,40 +589,20 @@ def get_driver(agent, proxy):
   driver.set_window_size(sizes[0], sizes[1])
   return driver
 
-def personalization(driver):
-  search = driver.find_element(By.XPATH,
-    f'//button[@aria-label="Turn {random.choice(["on","off"])} Search customization"]')
-  driver.execute_script("arguments[0].scrollIntoView();", search)
-  search.click()
-
-  history = driver.find_element(By.XPATH,
-    f'//button[@aria-label="Turn {random.choice(["on","off"])} YouTube History"]')
-  driver.execute_script("arguments[0].scrollIntoView();", history)
-  history.click()
-
-  ad = driver.find_element(By.XPATH,
-    f'//button[@aria-label="Turn {random.choice(["on","off"])} Ad personalization"]')
-  driver.execute_script("arguments[0].scrollIntoView();", ad)
-  ad.click()
-
-  confirm = driver.find_element(By.XPATH, '//button[@jsname="j6LnYe"]')
-  driver.execute_script("arguments[0].scrollIntoView();", confirm)
-  confirm.click()
-
-
-def bypass_consent(identifier, driver):
+accept_texts = ("j'accepte", "i agree", "jag godkänner", "ich stimme zu", "acepto", "accepto", "accetto", "aceito", "ak stem in", "jeg accepterer", "nõustun", "souhlasím", "ik ga akkoord", "принимаю", "saya setuju", "hyväksyn", "ຂ້າພະເຈົ້າຍອມຮັບ", "我同意")
+def bypass_consent(driver):
   try:
-    consent = driver.find_element(By.XPATH, "//button[@jsname='higCR']")
+    consent = driver.find_element(By.XPATH, "//*[lower-case(.)={accept_texts}]")
+    driver.execute_script("arguments[0].scrollIntoView();", consent)
+    consent.click()
   except selenium.common.exceptions.NoSuchElementException:
-    try:
-      consent = driver.find_element(By.XPATH, "//input[@type='submit' and @value='I agree']")
-    except selenium.common.exceptions.NoSuchElementException:
-      return
-  combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Bypassing consent..."))
-  driver.execute_script("arguments[0].scrollIntoView();", consent)
-  consent.click()
-  if 'consent' in driver.current_url:
-    personalization(driver)
+    pass
+
+def bypass_unsupported_browser(driver):
+  time.sleep(random.uniform(1, 2))
+  while 'www.youtube.com/supported_browsers' in driver.current_url:
+    driver.find_element(By.CSS_SELECTOR, "a#return-to-youtube").click()
+    time.sleep(random.uniform(0.1, 1))
 
 def bypass_signin(driver):
   for _ in range(10):
@@ -556,18 +626,6 @@ def bypass_signin(driver):
         pass
 
 
-def bypass_popup(driver):
-  try:
-    agree = WebDriverWait(driver, 5).until(EC.visibility_of_element_located(
-      (By.XPATH, '//*[@aria-label="Agree to the use of cookies and other data for the purpos.namees described"]')))
-    driver.execute_script(
-      "arguments[0].scrollIntoView();", agree)
-    time.sleep(1)
-    agree.click()
-  except Exception:
-    pass
-
-
 def bypass_other_popups(driver):
   labels = ['Got it', 'Skip trial', 'No thanks', 'Dismiss', 'Not now']
   random.shuffle(labels)
@@ -579,12 +637,11 @@ def bypass_other_popups(driver):
 
 
 def skip_stuff(identifier, driver):
-  bypass_popup(driver)
   try:
     WebDriverWait(driver, 15).until(EC.element_to_be_clickable(
       (By.CLASS_NAME, "ytp-ad-preview-container")))
   except Exception:
-    combined_log(log_regular_events, (colors.OKBLUE, identifier + f"No ads found"))
+    combined_log(log_regular_events, (colors.OKBLUE, identifier + "No ads found"))
   else:
     try:
       combined_log(log_regular_events, (colors.OKBLUE, identifier + "Skipping Ads..."))
@@ -596,68 +653,133 @@ def skip_stuff(identifier, driver):
       combined_log(log_regular_errors, (colors.OKBLUE, identifier + f"Ad skipping exception: {repr(e)}"))
   bypass_other_popups(driver)
 
-def type_keyword(driver, keyword, retry=False):
-  input_keyword = driver.find_element_by_css_selector(By.CSS_SELECTOR, 'input#search')
-
-  if retry:
-    for _ in range(10):
-      try:
-        input_keyword.click()
-        break
-      except Exception:
-        time.sleep(5)
-        pass
-
-  input_keyword.clear()
+def type_keyword(driver, search_bar, keyword):
+  search_bar = first_action_wrap(driver, EC.visibility_of_element_located(search_bar))
+  bypass_consent(driver)
+  for _ in range(3):
+    try:
+      search_bar.click()
+      break
+    except Exception:
+      time.sleep(3)
+  search_bar.clear()
+  interval = random.weibullvariate(0.18, 1.7) + 0.04
   for letter in keyword:
-    input_keyword.send_keys(letter)
-    time.sleep(random.uniform(.1, .4))
+    time.sleep(interval * random.weibullvariate(1.1, 4) if letter != ' ' else 0.2 + random.weibullvariate(0.4, 1.8))
+    search_bar.send_keys(letter)
+  time.sleep(interval * random.weibullvariate(0.9, 4))
+  return search_bar
 
+def make_video_finder(videos, formatter):
+  video_matchers = []
+  for video in videos:
+    video_matchers.append((formatter(video.title), video))
+    for alt in video.alt_titles:
+      video_matchers.append((formatter(alt), video))
+  def finder(driver):
+    for matcher, video in video_matchers:
+      try:
+        video_element = driver.find_element(*matcher)
+      except selenium.common.exceptions.NoSuchElementException:
+        continue
+      driver.execute_script("arguments[0].scrollIntoView({behavior: 'auto', block: 'center', inline: 'center'});", video_element)
+      WebDriverWait(driver, 30).until(EC.element_to_be_clickable(matcher))
+      time.sleep(random.uniform(0.1, 1))
+      video_element.click()
+      return video
+    time.sleep(random.uniform(0.5, 1.5))
+  return finder
+
+def bing_search(driver, keywords, videos):
+  first_page_wrap(driver, "https://www.bing.com")
+  search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#sb_form_q'), keywords)
+  search_bar.send_keys(Keys.ENTER)
+  WebDriverWait(driver, 30).until(EC.element_to_be_clickable(
+    (By.CSS_SELECTOR, "ol#b_results")))
+  driver.find_element(By.CSS_SELECTOR, "li#b-scopeListItem-video").click()
+  for e in driver.find_elements(By.CSS_SELECTOR, "div#stp_popup_closebtn"):
+    try:
+      e.click()
+    except Exception: pass
+  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//strong[text()="{title.replace("+", "")}"]'))
+  for i in range(10):
+    time.sleep(random.uniform(1, 2))
+    result = finder(driver)
+    if result:
+      WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.view_page'))).click()
+      return result
+    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
+
+def duck_search(driver, keywords, videos):
+  first_page_wrap(driver, "https://duckduckgo.com")
+  if 'html' in driver.current_url:
+    driver.get(f'https://duckduckgo.com/?q={keywords}&iax=videos&ia=videos')
+  else:
+    search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search_form_input_homepage'), keywords)
+    search_bar.send_keys(Keys.ENTER)
+    WebDriverWait(driver, 30).until(EC.element_to_be_clickable(
+      (By.CSS_SELECTOR, "div#links.results")))
+    time.sleep(random.uniform(0.5, 1))
+    driver.find_element(By.XPATH, "//*[@data-zci-link='videos']").click()
+  for e in driver.find_elements(By.CSS_SELECTOR, "span.js-badge-link-dismiss"):
+    try:
+      e.click()
+    except Exception: pass
+  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//a[text()="{title}"]'))
+  for i in range(10):
+    time.sleep(random.uniform(1, 2))
+    try:
+      driver.find_element(By.XPATH, "//*[@data-zci-link='videos']").click()
+    except Exception: pass
+    result = finder(driver)
+    if result:
+      try:
+        WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.js-video-privacy-leave'))).click()
+      except Exception as e:
+        if not 'youtube.com' in driver.current_url:
+          raise e
+      return result
+    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
+
+def yt_search(driver, keywords, videos):
+  spoof_referer(driver, random.choice(SEARCH_ENGINES), "https://www.youtube.com/")
+  bypass_unsupported_browser(driver)
+  search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search'), keywords)
   if random.randrange(2):
-    input_keyword.send_keys(Keys.ENTER)
+    search_bar.send_keys(Keys.ENTER)
   else:
     try:
       driver.find_element(By.XPATH, '//*[@id="search-icon-legacy"]').click()
     except Exception:
-      driver.execute_script(
-        'document.querySelector("#search-icon-legacy").click()')
-
-def find_video(driver, videos):
+      driver.execute_script('document.querySelector("#search-icon-legacy").click()')
+  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//*[@title="{title}"]'))
   for i in range(10):
     try:
       container = WebDriverWait(driver, 3).until(EC.visibility_of_element_located(
         (By.XPATH, f'//ytd-item-section-renderer[{i}]')))
     except selenium.common.exceptions.TimeoutException:
       container = driver
-    for video in videos:
-      try:
-        video_element = container.find_element(By.XPATH, f'//*[@title="{video.title}"]')
-      except selenium.common.exceptions.NoSuchElementException:
-        continue
-      driver.execute_script("arguments[0].scrollIntoView();", video_element)
-      time.sleep(1)
-      bypass_popup(driver)
-      try:
-        video_element.click()
-      except Exception:
-        driver.execute_script("arguments[0].click();", video_element)
-      return video
-    time.sleep(2)
+    result = finder(driver)
+    if result:
+      return result
+    time.sleep(random.uniform(0.5, 1.5))
+    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
+
+def find_video_suggestion(driver, videos):
+  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//*[@title="{title}"]'))
+  while True:
+    result = finder(driver)
+    if result:
+      return result
+    time.sleep(random.uniform(0.5, 1.5))
+    if not driver.find_elements(By.CSS_SELECTOR, 'ytd-continuation-item-renderer'):
+      break
     WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.TAG_NAME, 'body'))).send_keys(Keys.CONTROL, Keys.END)
 
-def yt_search_video(driver, keyword, videos):
-  try:
-    type_keyword(driver, keyword)
-  except Exception:
-    try:
-      bypass_popup(driver)
-      type_keyword(driver, keyword, retry=True)
-    except selenium.common.exceptions.TimeoutException:
-      raise PageLoadError()
-  return find_video(driver, videos)
-
-def play_video(driver):
+def play_video(driver, title):
+  if not title in driver.title:
+    raise Exception("Watching wrong video!")
   try:
     try:
       driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
@@ -666,19 +788,17 @@ def play_video(driver):
     driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Pause (k)"]')
   except Exception:
     try:
-      driver.find_element_by_css_selector(By.CSS_SELECTOR,
-        'button.ytp-large-play-button.ytp-button').send_keys(Keys.ENTER)
+      driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Play (k)"]').click()
     except Exception:
       try:
-        driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Play (k)"]').click()
+        driver.execute_script(
+          "document.querySelector('button.ytp-play-button.ytp-button').click()")
       except Exception:
-        try:
-          driver.execute_script(
-            "document.querySelector('button.ytp-play-button.ytp-button').click()")
-        except Exception:
-          pass
+        pass
 
-def play_music(driver):
+def play_music(driver, title):
+  if not title in driver.title:
+    raise Exception("Watching wrong video!")
   try:
     try:
       driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
@@ -692,21 +812,23 @@ def play_music(driver):
       driver.execute_script(
         'document.querySelector("#play-pause-button").click()')
 
-def play(identifier, cooldown_url, driver, fake_watch = False):
+def play(identifier, cooldown_url, driver, title, fake_watch = False):
+  bypass_consent(driver)
   skip_stuff(identifier, driver)
   if "music.youtube.com" in driver.current_url:
     content_type = 'Music'
-    play_music(driver)
+    play_music(driver, title)
     view_stat = 'Music'
   else:
     content_type = 'Video'
-    play_video(driver)
+    play_video(driver, title)
     if bandwidth:
       save_bandwidth(driver)
     change_playback_speed(driver)
     view_stat = WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.XPATH, '//span[@class="view-count style-scope ytd-video-view-count-renderer"]'))).text
 
+  view_accounted = False
   if fake_watch:
     time.sleep(random.uniform(5, 10))
   elif 'watching' in view_stat:
@@ -720,12 +842,15 @@ def play(identifier, cooldown_url, driver, fake_watch = False):
         combined_log(log_regular_events, (colors.OKGREEN, identifier + "Stream found, "), (colors.OKCYAN, f"{view_stat} "))
       else:
         error += 1
-      play_video(driver)
-      random_command(driver)
+      random_command(identifier, driver)
+      play_video(driver, title)
       if error == 5:
         break
       time.sleep(60)
       watch_time.increment(60/3600)
+      if not view_accounted:
+        views.increment()
+        view_accounted = True
   else:
     try:
       current_url = driver.current_url
@@ -740,29 +865,28 @@ def play(identifier, cooldown_url, driver, fake_watch = False):
     except Exception:
       combined_log('html', (colors.FAIL, identifier + "Suppressed exception before playing: {traceback.format_exc()}"))
 
-    update_interval = 5
-    update_counter = 1
     prev_time = 0
     for _ in range(round(video_len/2)):
       if terminated:
         raise TerminatedError()
-      time.sleep(random.uniform(10, 20))
-      current_time = driver.execute_script(
-        "return document.getElementById('movie_player').getCurrentTime()")
-      if update_counter % update_interval:
-        update_counter += 1
-      elif database:
-        watch_time.increment((current_time - prev_time)/3600)
-        prev_time = current_time
+      time.sleep(random.uniform(20, 30))
+      if not view_accounted:
+        views.increment()
+        view_accounted = True
+      current_time = driver.execute_script("return document.getElementById('movie_player').getCurrentTime()")
+      watch_time.increment((current_time - prev_time)/3600)
+      prev_time = current_time
       if content_type == 'Video':
-        play_video(driver)
-        random_command(driver)
+        random_command(identifier, driver)
+        play_video(driver, title)
       elif content_type == 'Music':
-        play_music(driver)
+        play_music(driver, title)
       if current_time > video_len or driver.current_url != current_url:
         break
   if random.randrange(2):
-    driver.find_element(By.ID, 'movie_player').send_keys('k')
+    movie_player = driver.find_element(By.ID, 'movie_player')
+    driver.execute_script("arguments[0].scrollIntoView();", movie_player)
+    movie_player.send_keys('k')
   cooldowns.add(cooldown_url, WATCH_COOLDOWN)
 
 def save_bandwidth(driver):
@@ -775,8 +899,7 @@ def save_bandwidth(driver):
     random_quality = random.choice(['144p', '240p', '360p'])
     quality = WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
       (By.XPATH, f"//span[contains(string(),'{random_quality}')]")))
-    driver.execute_script(
-      "arguments[0].scrollIntoView();", quality)
+    driver.execute_script("arguments[0].scrollIntoView();", quality)
     quality.click()
 
   except Exception:
@@ -786,7 +909,6 @@ def save_bandwidth(driver):
     except Exception:
       pass
 
-
 def change_playback_speed(driver):
   if playback_speed == 2:
     driver.find_element(By.ID, 'movie_player').send_keys('<'*random.randrange(3) + 1)
@@ -794,26 +916,30 @@ def change_playback_speed(driver):
     driver.find_element(By.ID, 'movie_player').send_keys('>'*random.randrange(3) + 1)
 
 
-def random_command(driver):
-  bypass_other_popups(driver)
-  option = random.choices([1, 2], cum_weights=(0.7, 1.00), k=1)[0]
-  if option == 2:
-    command = random.choice(COMMANDS)
-    if command in ['m', 't', 'c']:
-      driver.find_element(By.ID, 'movie_player').send_keys(command)
-    elif command == 'k':
-      press = random.randrange(2)
-      if press:
-        driver.find_element(By.ID, 'movie_player').send_keys(command)
-      for _ in range(2, 5):
-        driver.execute_script(f'document.querySelector("#comments").scrollBy({random.uniform(300, 700)});')
-        time.sleep(random.uniform(0.5, 3))
-      driver.execute_script(
-        'document.querySelector("#movie_player").scrollIntoView(true);')
-      if press:
-        driver.find_element(By.ID, 'movie_player').send_keys(command)
-    else:
-      driver.find_element(By.ID, 'movie_player').send_keys(command*(random.randrange(5)+1))
+def random_command(identifier, driver):
+  try:
+    bypass_other_popups(driver)
+    option = random.choices([1, 2], cum_weights=(0.7, 1.00), k=1)[0]
+    if option == 2:
+      movie_player = driver.find_element(By.ID, 'movie_player')
+      driver.execute_script("arguments[0].scrollIntoView();", movie_player)
+      command = random.choice(COMMANDS)
+      if command in {'m', 't', 'c'}:
+        movie_player.send_keys(command)
+      elif command == 'k':
+        press = random.randrange(2)
+        if press:
+          movie_player.send_keys(command)
+        for _ in range(2, 5):
+          driver.execute_script(f'window.scrollBy(0, {random.uniform(300, 700)});')
+          time.sleep(random.uniform(0.5, 3))
+        driver.execute_script("arguments[0].scrollIntoView();", movie_player)
+        if press:
+          movie_player.send_keys(command)
+      else:
+        movie_player.send_keys(command*(random.randrange(5)+1))
+  except Exception:
+    combined_log('html', (colors.FAIL, identifier + f"Random command error: {traceback.format_exc()}"))
 
 def quit_driver(driver):
   driver_list.remove(driver)
@@ -825,16 +951,15 @@ def view_thread(identifier, proxy):
     combined_log(log_proxy_events, (colors.OKGREEN, identifier + "Opening a driver..."))
     driver = get_driver(useragents.random, proxy)
     try:
-      time.sleep(2)
       for _ in range(4):
         current = random.choice(videos.all_videos)
         current.open(identifier, driver)
         if video_player_count.value < max_video_players:
           try:
             video_player_count.increment()
-            play(identifier, proxy.url, driver, current.fake_watch)
+            play(identifier, proxy.url, driver, current.title, current.fake_watch)
             for idx in range(random.randint(3, 5)):
-              next = find_video(driver, videos.targeted_videos)
+              next = find_video_suggestion(driver, videos.targeted_videos)
               if not next:
                 combined_log('html', (colors.FAIL, identifier + f"Can't find a recommended video from {current.title}, opening a new one"))
                 current = random.choice(videos.targeted_videos)
@@ -842,7 +967,7 @@ def view_thread(identifier, proxy):
               else:
                 combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Jumped '{current.title}' --> '{next.title}'"))
                 current = next
-              play(identifier, proxy.url, driver, current.fake_watch)
+              play(identifier, proxy.url, driver, current.title, current.fake_watch)
           finally:
             video_player_count.increment(-1)
         else:
@@ -850,9 +975,9 @@ def view_thread(identifier, proxy):
           time.sleep(over_limit_sleep)
           break
       combined_log(log_regular_events, (colors.OKBLUE, identifier + "Closing video player"))
-    except PageLoadError:
+    except (FirstPageError, FirstActionError, LoadingError) as e:
       cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
-      combined_log(log_regular_errors, (colors.FAIL, identifier + f"Page load error! Slow internet speed or stuck at recaptcha"))
+      combined_log(log_regular_errors, (colors.FAIL, identifier + f"{type(e).__name__}! Slow internet or stuck at recaptcha"))
       return
     except selenium.common.exceptions.WebDriverException:
       cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
@@ -881,25 +1006,44 @@ def check_monitored_files():
   while not terminated:
     time.sleep(FILE_CHECK_PERIOD)
 
+def exit_report():
+  print_route_records()
+  print_view_records()
+
+def print_view_records():
+  print(f'Views: {views.value - og_views}')
+  print(f'Hours: {watch_time.value - og_watch_time}')
+def print_route_records():
+  print('S: success, C: connection failure, F: other failure')
+  if videos.route_records:
+    for type, record in list(videos.route_records.items()):
+      print(f'{type}: {record}')
+  else:
+    print('No Data')
+
 def process_cmd(cmd):
   cmd = cmd.lower()
   global max_video_players
   global detailed_proxy_errors
-  if cmd in ['status', 's']:
-    print(rf"""Browser count: {browser_count.value}
-Video player count: {video_player_count.value}/{max_video_players}""")
-  elif cmd[1:] in ['player', 'players', 'p']:
+  if cmd in {'player_status', 'players', 'player', 'p'}:
+    print(f"Browser count: {browser_count.value}")
+    print(f"Video player count: {video_player_count.value}/{max_video_players}")
+  elif cmd[1:] in {'player', 'players', 'p'}:
     if cmd[0] == '+':
       max_video_players += 1
     elif cmd[0] == '-':
       max_video_players -= 1
     elif cmd[0] == '0':
       max_video_players = 0
-    elif cmd[0] != '?':
+    else:
       print("Invalid operator: {cmd[0]}")
     print(f"Max video players: {max_video_players}")
-  elif cmd[1:] in ['proxy errors', 'proxy_errors', 'pe']:
+  elif cmd[1:] in {'proxy errors', 'proxy_errors', 'pe'}:
     detailed_proxy_errors = cmd[0] == '+'
+  elif cmd in {'route_records', 'records', 'r'}:
+    print_route_records()
+  elif cmd in {'view_stats', 'views', 'v'}:
+    print_view_records()
   elif cmd:
     print(f"Invalid command: {cmd}")
 
@@ -950,6 +1094,7 @@ def main():
   except KeyboardInterrupt:
     try:
       terminated = True
+      exit_report()
       print()
       print("Stopping subprocesses... please wait")
       if webserver_thread and webserver_thread.is_alive():
@@ -983,6 +1128,7 @@ if __name__ == '__main__':
   host = config["http_api"]["host"]
   port = config["http_api"]["port"]
   database = config["database"]
+  search_boost = config["search_boost"]
   headless = config["headless"]
   filter_anonymity = config["filter_anonymity"]
   firefox_path = config["firefox_path"]
