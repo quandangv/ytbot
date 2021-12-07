@@ -706,7 +706,9 @@ def bing_search(driver, keywords, videos):
     time.sleep(random.uniform(1, 2))
     result = finder(driver)
     if result:
-      WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.view_page'))).click()
+      while not "youtube.com" in driver.current_url:
+        time.sleep(random.uniform(0.5, 1))
+        WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.view_page'))).click()
       return result
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
