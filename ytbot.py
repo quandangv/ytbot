@@ -672,7 +672,7 @@ def type_keyword(driver, search_bar, keyword):
   time.sleep(interval * random.weibullvariate(0.9, 4))
   return search_bar
 
-def make_video_finder(videos, formatter):
+def make_video_finder(videos, formatter, *popups):
   video_matchers = []
   for video in videos:
     video_matchers.append((formatter(video.title), video))
@@ -684,8 +684,11 @@ def make_video_finder(videos, formatter):
         video_element = driver.find_element(*matcher)
       except selenium.common.exceptions.NoSuchElementException:
         continue
-      driver.execute_script("arguments[0].scrollIntoView({behavior: 'auto', block: 'center', inline: 'center'});", video_element)
+      driver.execute_script("arguments[0].scrollIntoView();", video_element)
       WebDriverWait(driver, 30).until(EC.element_to_be_clickable(matcher))
+      for selector in popups:
+        for e in driver.find_elements(By.CSS_SELECTOR, selector):
+          driver.execute_script("var element = arguments[0]; element.parentNode.removeChild(element);", e)
       time.sleep(random.uniform(0.1, 1))
       video_element.click()
       return video
@@ -696,21 +699,20 @@ def bing_search(driver, keywords, videos):
   first_page_wrap(driver, "https://www.bing.com")
   search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#sb_form_q'), keywords)
   search_bar.send_keys(Keys.ENTER)
-  WebDriverWait(driver, 30).until(EC.element_to_be_clickable(
-    (By.CSS_SELECTOR, "ol#b_results")))
+  WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "ol#b_results")))
   driver.find_element(By.CSS_SELECTOR, "li#b-scopeListItem-video").click()
-  for e in driver.find_elements(By.CSS_SELECTOR, "div#stp_popup_closebtn"):
-    try:
-      e.click()
-    except Exception: pass
-  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//strong[text()="{title.replace("+", "")}"]'))
+  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//strong[text()="{title.replace("+", "")}"]'), "drv#stp_popup_tutorial")
   for i in range(10):
     time.sleep(random.uniform(1, 2))
     result = finder(driver)
     if result:
       while not "youtube.com" in driver.current_url:
         time.sleep(random.uniform(0.5, 1))
-        WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.view_page'))).click()
+        try:
+          WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a.view_page'))).click()
+        except Exception as e:
+          if not "youtube.com" in driver.current_url:
+            raise e
       return result
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
@@ -1126,8 +1128,8 @@ if __name__ == '__main__':
   with open('config.json', 'r') as openfile:
     config = json.load(openfile)
 
-  api = config["http_api"]["enabled"]
   jumping_video_boost = config.get("jumping_video_boost", 1)
+  api = config["http_api"]["enabled"]
   host = config["http_api"]["host"]
   port = config["http_api"]["port"]
   database = config["database"]
@@ -1143,7 +1145,7 @@ if __name__ == '__main__':
   proxy_thread_count = config["proxy_thread_count"]
   browser_ratio = config["browser_per_video_player"]
   max_video_players = config["video_player_count"]
-  max_browsers = config["max_browsers"]
+  max_browsers = config.get("max_browsers", 20)
   over_limit_sleep = proxy_thread_count*OVER_LIMIT_SLEEP_UNIT
 
   videos = Videos()
