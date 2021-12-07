@@ -100,8 +100,8 @@ COOLDOWN_DATABASE = 'proxy_cooldowns.db'
 VIEWPORT = ['2560x1440', '1920x1080', '1440x900', '1536x864', '1366x768', '1280x1024', '1024x768']
 
 SEARCH_ENGINES = ['https://search.yahoo.com/', 'https://duckduckgo.com/', 'https://www.google.com/',
-      'https://www.bing.com/']
-REFERERS = SEARCH_ENGINES + ['https://t.co/', '']
+      'https://www.bing.com/', '', '']
+REFERERS = SEARCH_ENGINES + ['https://t.co/']
 
 GOOGLE_LINK_TEMPLATE = "https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=video&cd=&url={url}"
 YOUTUBE_LINK_TEMPLATE = "https://www.youtube.com/watch?v={id}"
@@ -128,7 +128,7 @@ def first_page_wrap(driver, url):
 
 def first_action_wrap(driver, condition):
   try:
-    return WebDriverWait(driver, 30).until(condition)
+    return WebDriverWait(driver, 20).until(condition)
     driver.get(url)
   except (selenium.common.exceptions.TimeoutException):
     raise FirstActionError()
@@ -435,11 +435,11 @@ class Video:
       if 'search' in route[0]:
         try:
           if route[0] == 'bing_search':
-            result = bing_search(driver, route[1], videos.targeted_videos)
+            result = bing_search(driver, route[1])
           elif route[0] == 'duck_search':
-            result = duck_search(driver, route[1], videos.targeted_videos)
+            result = duck_search(driver, route[1])
           elif route[0] == 'yt_search':
-            result = yt_search(driver, route[1], videos.targeted_videos)
+            result = yt_search(driver, route[1])
           else:
             raise Exception(f"Invalid route type: {route[0]}")
           if result:
@@ -672,9 +672,9 @@ def type_keyword(driver, search_bar, keyword):
   time.sleep(interval * random.weibullvariate(0.9, 4))
   return search_bar
 
-def make_video_finder(videos, formatter, *popups):
+def make_video_finder(formatter, *popups):
   video_matchers = []
-  for video in videos:
+  for video in videos.targeted_videos:
     video_matchers.append((formatter(video.title), video))
     for alt in video.alt_titles:
       video_matchers.append((formatter(alt), video))
@@ -684,24 +684,31 @@ def make_video_finder(videos, formatter, *popups):
         video_element = driver.find_element(*matcher)
       except selenium.common.exceptions.NoSuchElementException:
         continue
-      driver.execute_script("arguments[0].scrollIntoView();", video_element)
       WebDriverWait(driver, 30).until(EC.element_to_be_clickable(matcher))
       for selector in popups:
         for e in driver.find_elements(By.CSS_SELECTOR, selector):
           driver.execute_script("var element = arguments[0]; element.parentNode.removeChild(element);", e)
-      time.sleep(random.uniform(0.1, 1))
-      video_element.click()
+      for i in reversed(range(10)):
+        try:
+          driver.execute_script("arguments[0].scrollIntoView();", video_element)
+          driver.execute_script(f'window.scrollBy(0, {random.uniform(-500, 0)});')
+          time.sleep(random.uniform(0.5, 2))
+          video_element.click()
+          break
+        except Exception as e:
+          if not i:
+            raise e
       return video
     time.sleep(random.uniform(0.5, 1.5))
   return finder
 
-def bing_search(driver, keywords, videos):
+def bing_search(driver, keywords):
   first_page_wrap(driver, "https://www.bing.com")
   search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#sb_form_q'), keywords)
   search_bar.send_keys(Keys.ENTER)
   WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "ol#b_results")))
   driver.find_element(By.CSS_SELECTOR, "li#b-scopeListItem-video").click()
-  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//strong[text()="{title.replace("+", "")}"]'), "drv#stp_popup_tutorial")
+  finder = make_video_finder(lambda title: (By.XPATH, f'//strong[text()="{title.replace("+", "")}"]'), "drv#stp_popup_tutorial")
   for i in range(10):
     time.sleep(random.uniform(1, 2))
     result = finder(driver)
@@ -716,7 +723,7 @@ def bing_search(driver, keywords, videos):
       return result
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
-def duck_search(driver, keywords, videos):
+def duck_search(driver, keywords):
   first_page_wrap(driver, "https://duckduckgo.com")
   if 'html' in driver.current_url:
     driver.get(f'https://duckduckgo.com/?q={keywords}&iax=videos&ia=videos')
@@ -731,7 +738,7 @@ def duck_search(driver, keywords, videos):
     try:
       e.click()
     except Exception: pass
-  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//a[text()="{title}"]'))
+  finder = make_video_finder(lambda title: (By.XPATH, f'//a[text()="{title}"]'))
   for i in range(10):
     time.sleep(random.uniform(1, 2))
     try:
@@ -747,18 +754,24 @@ def duck_search(driver, keywords, videos):
       return result
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
-def yt_search(driver, keywords, videos):
+def yt_search(driver, keywords):
   spoof_referer(driver, random.choice(SEARCH_ENGINES), "https://www.youtube.com/")
+  time.sleep(5)
   bypass_unsupported_browser(driver)
-  search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search'), keywords)
-  if random.randrange(2):
-    search_bar.send_keys(Keys.ENTER)
-  else:
-    try:
-      driver.find_element(By.XPATH, '//*[@id="search-icon-legacy"]').click()
-    except Exception:
-      driver.execute_script('document.querySelector("#search-icon-legacy").click()')
-  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//*[@title="{title}"]'))
+  try:
+    search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search'), keywords)
+  except FirstActionError:
+    bypass_unsupported_browser(driver)
+    search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search'), keywords)
+  while not 'www.youtube.com/results' in driver.current_url:
+    if random.randrange(2):
+      search_bar.send_keys(Keys.ENTER)
+    else:
+      try:
+        driver.find_element(By.XPATH, '//*[@id="search-icon-legacy"]').click()
+      except Exception:
+        driver.execute_script('document.querySelector("#search-icon-legacy").click()')
+  finder = make_video_finder(lambda title: (By.XPATH, f'//*[@title="{title}"]'))
   for i in range(10):
     try:
       container = WebDriverWait(driver, 3).until(EC.visibility_of_element_located(
@@ -771,8 +784,8 @@ def yt_search(driver, keywords, videos):
     time.sleep(random.uniform(0.5, 1.5))
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
-def find_video_suggestion(driver, videos):
-  finder = make_video_finder(videos, lambda title: (By.XPATH, f'//*[@title="{title}"]'))
+def find_video_suggestion(driver):
+  finder = make_video_finder(lambda title: (By.XPATH, f'//*[@title="{title}"]'))
   for i in range(10):
     result = finder(driver)
     if result:
@@ -783,9 +796,15 @@ def find_video_suggestion(driver, videos):
     WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.TAG_NAME, 'body'))).send_keys(Keys.CONTROL, Keys.END)
 
-def play_video(driver, title):
-  if not title in driver.title:
-    raise Exception("Watching wrong video!")
+def check_title(driver):
+  for video in videos.targeted_videos:
+    if video.title in driver.title: return True
+    for alt in video.alt_titles:
+      if alt in driver.title: return True
+
+def play_video(driver):
+  if not check_title(driver):
+    raise Exception(f"Watching wrong video: {driver.title}")
   try:
     try:
       driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
@@ -803,8 +822,8 @@ def play_video(driver, title):
         pass
 
 def play_music(driver, title):
-  if not title in driver.title:
-    raise Exception("Watching wrong video!")
+  if not check_title(driver):
+    raise Exception(f"Watching wrong video: {driver.title}")
   try:
     try:
       driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
@@ -827,7 +846,7 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
     view_stat = 'Music'
   else:
     content_type = 'Video'
-    play_video(driver, title)
+    play_video(driver)
     if bandwidth:
       save_bandwidth(driver)
     change_playback_speed(driver)
@@ -849,7 +868,7 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
       else:
         error += 1
       random_command(identifier, driver)
-      play_video(driver, title)
+      play_video(driver)
       if error == 5:
         break
       time.sleep(60)
@@ -884,9 +903,9 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
       prev_time = current_time
       if content_type == 'Video':
         random_command(identifier, driver)
-        play_video(driver, title)
+        play_video(driver)
       elif content_type == 'Music':
-        play_music(driver, title)
+        play_music(driver)
       if current_time > video_len or driver.current_url != current_url:
         break
   if random.randrange(2):
@@ -965,7 +984,7 @@ def view_thread(identifier, proxy):
             video_player_count.increment()
             play(identifier, proxy.url, driver, current.title, current.fake_watch)
             for idx in range(random.randint(3, 5)):
-              next = find_video_suggestion(driver, videos.targeted_videos)
+              next = find_video_suggestion(driver)
               if not next:
                 combined_log('html', (colors.FAIL, identifier + f"Can't find a recommended video from {current.title}, opening a new one"))
                 current = random.choice(videos.targeted_videos)
