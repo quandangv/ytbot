@@ -516,7 +516,7 @@ class Videos:
       self.route_records[route_type].add_record(record_type, route_data)
 
 def needed_browsers():
-  return max(0, browser_ratio * (max_video_players - video_player_count.value) + video_player_count.value)
+  return min(max_browsers, max(0, browser_ratio * (max_video_players - video_player_count.value) + video_player_count.value))
 
 
 def get_null_path():
@@ -548,10 +548,12 @@ def get_driver(agent, proxy):
 
   sizes = random.choice(VIEWPORT).split('x')
   options.set_preference("media.volume_scale", "0.001")
+  options.set_preference("media.default_volume", "0.001")
   options.set_preference("toolkit.cosmeticAnimations.enabled", "false")
   options.set_preference("general.useragent.override", agent)
-  options.set_preference("media.default_volume", "0.001")
   options.set_preference("media.autoplay.default", 0)
+  options.set_preference("browser.link.open_newwindow", 1)
+  options.set_preference("browser.link.open_newwindow.restriction", 0)
   options.set_preference("browser.cache.disk.enable", "false")
   options.set_preference("browser.cache.disk_cache_ssl", "false")
   options.set_preference("browser.cache.memory.enable", "false")
@@ -1124,7 +1126,6 @@ if __name__ == '__main__':
   with open('config.json', 'r') as openfile:
     config = json.load(openfile)
 
-  global max_browsers
   api = config["http_api"]["enabled"]
   jumping_video_boost = config.get("jumping_video_boost", 1)
   host = config["http_api"]["host"]
@@ -1142,6 +1143,7 @@ if __name__ == '__main__':
   proxy_thread_count = config["proxy_thread_count"]
   browser_ratio = config["browser_per_video_player"]
   max_video_players = config["video_player_count"]
+  max_browsers = config["max_browsers"]
   over_limit_sleep = proxy_thread_count*OVER_LIMIT_SLEEP_UNIT
 
   videos = Videos()
