@@ -86,7 +86,7 @@ def get_null_path():
 def take_screenshot(driver):
   if not terminated:
     Path("screenshots").mkdir(parents=True, exist_ok=True)
-    path = datetime.datetime.now().strftime("screenshots/%d-%b-%Y %H:%M:%S.png")
+    path = datetime.datetime.now().strftime("screenshots/%d-%b-%Y %H-%M-%S.png")
     driver.get_screenshot_as_file(path)
 
 class LoadingError(Exception): pass
@@ -540,6 +540,8 @@ def make_video_finder(formatter, *popups):
     for matcher, video in video_matchers:
       try:
         video_element = driver.find_element(*matcher)
+        if not video_element.displayed() or not video_element.enabled():
+          continue
       except selenium.common.exceptions.NoSuchElementException:
         continue
       for selector in popups:
@@ -630,7 +632,7 @@ def yt_search(driver, keywords):
         driver.execute_script('document.querySelector("#search-icon-legacy").click()')
     if 'www.youtube.com/results' in driver.current_url:
       break
-  finder = make_video_finder(lambda title: (By.XPATH, f'//*[@title="{title}"]'))
+  finder = make_video_finder(lambda title: (By.XPATH, f'//a[@id="video-title" and @title="{title}"]'))
   for i in range(10):
     try:
       container = WebDriverWait(driver, 3).until(EC.visibility_of_element_located(
@@ -644,7 +646,7 @@ def yt_search(driver, keywords):
     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.CONTROL, Keys.END)
 
 def find_video_suggestion(driver):
-  finder = make_video_finder(lambda title: (By.XPATH, f'//*[@title="{title}"]'))
+  finder = make_video_finder(lambda title: (By.XPATH, f'//span[@id="video-title" and @title="{title}"]'))
   for i in range(10):
     result = finder(driver)
     if result:
@@ -768,9 +770,8 @@ def bypass_consent(driver):
       driver.execute_script("arguments[0].scrollIntoView();", consent)
       time.sleep(random.uniform(0.5, 1))
       consent.click()
-    except (selenium.common.exceptions.ElementNotVisibleException, selenium.common.exceptions.ElementNotInteractableException):
-      traceback.print_exc()
-      print(i)
+    except (selenium.common.exceptions.ElementNotVisibleException, selenium.common.exceptions.ElementNotInteractableException) as e:
+      combined_log(log_regular_errors, (colors.OKBLUE, identifier + f"Bypass consent error: {repr(e)}"))
       return i
   else:
     raise Exception("Consent form still visible after 50 tries")
@@ -778,7 +779,10 @@ def bypass_consent(driver):
 def bypass_unsupported_browser(driver):
   time.sleep(random.uniform(1, 2))
   while 'www.youtube.com/supported_browsers' in driver.current_url:
-    driver.find_element(By.CSS_SELECTOR, "a#return-to-youtube").click()
+    try:
+      driver.find_element(By.CSS_SELECTOR, "a#return-to-youtube").click()
+    except Exception:
+      traceback.print_exc()
     time.sleep(random.uniform(0.1, 1))
 
 def bypass_signin(driver):
@@ -880,8 +884,12 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
     if save_bandwidth:
       reduce_bandwidth(driver)
     change_playback_speed(driver)
-    view_stat = WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
-      (By.XPATH, '//span[@class="view-count style-scope ytd-video-view-count-renderer"]'))).text
+    try:
+      view_stat = WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
+        (By.XPATH, '//span[@class="view-count style-scope ytd-video-view-count-renderer"]'))).text
+    except Exception as e:
+      error_log(log_regular_errors, identifier + f"Can't find video stat: {repr(e)}")
+      view_stat = "0 views"
 
   view_accounted = False
   if fake_watch:
