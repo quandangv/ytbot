@@ -1,4 +1,5 @@
 import hashlib
+from pathlib import Path
 import json
 import os
 import re
@@ -22,7 +23,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import website
-from config import create_config
 
 detailed_proxy_errors = True
 log_reached_limit = False
@@ -44,6 +44,7 @@ YOUTU_BE_LINK_TEMPLATE = "https://youtu.be/{id}"
 
 os.system("")
 website.database = STAT_DATABASE
+start_time = time.time()
 
 ################ UTILS ################
 
@@ -82,6 +83,12 @@ def get_null_path():
   else:
     raise Exception("Operating system not supported: " + os.name)
 
+def take_screenshot(driver):
+  if not terminated:
+    Path("screenshots").mkdir(parents=True, exist_ok=True)
+    path = datetime.datetime.now().strftime("screenshots/%d-%b-%Y %H:%M:%S.png")
+    driver.get_screenshot_as_file(path)
+
 class LoadingError(Exception): pass
 class FirstActionError(LoadingError): pass
 class FirstPageError(FirstActionError): pass
@@ -108,7 +115,7 @@ def combined_log(level, *text_tups):
     timestamp = datetime.datetime.now().strftime("[%d-%b-%Y %H:%M:%S] ")
     text_tups = [(colors.NONE, timestamp), *text_tups]
     print(''.join([color[0] + msg for color, msg in text_tups]) + colors.ENDC)
-    if api and level == 'html':
+    if web_interface and level == 'html':
       if len(website.console) > 50:
         website.console.pop(0)
       html = ''.join([f'<span style="color:{key[1]}"> {value} </span>' for key, value in text_tups])
@@ -486,11 +493,11 @@ class RouteRecord:
       if record[self.SUCCESS]:
         msg.append(colors.OKGREEN[0] + f'S{record[self.SUCCESS]}')
       if record[self.CONNECTION_FAILURE]:
-        msg.append(colors.WARNING[0] + f'S{record[self.CONNECTION_FAILURE]}')
+        msg.append(colors.WARNING[0] + f'C{record[self.CONNECTION_FAILURE]}')
       if record[self.FAILURE]:
-        msg.append(colors.FAIL[0] + f'S{record[self.FAILURE]}')
+        msg.append(colors.FAIL[0] + f'F{record[self.FAILURE]}')
       return '-'.join(msg) + colors.ENDC
-    data_str = ', '.join(f'{data}: {format_record(ratio)}' for data, ratio in self.data_failures.items())
+    data_str = ''.join(f'\n  {data}: {format_record(ratio)}' for data, ratio in self.data_failures.items())
     return f'RouteRecord({format_record(self.type_failures)}, {{{data_str}}})'
   def add_record(self, record_type, data=None):
     if record_type == self.TYPE_FAILURE:
@@ -535,7 +542,6 @@ def make_video_finder(formatter, *popups):
         video_element = driver.find_element(*matcher)
       except selenium.common.exceptions.NoSuchElementException:
         continue
-      WebDriverWait(driver, 30).until(EC.element_to_be_clickable(matcher))
       for selector in popups:
         for e in driver.find_elements(By.CSS_SELECTOR, selector):
           driver.execute_script("var element = arguments[0]; element.parentNode.removeChild(element);", e)
@@ -614,7 +620,7 @@ def yt_search(driver, keywords):
   except FirstActionError:
     bypass_unsupported_browser(driver)
     search_bar = type_keyword(driver, (By.CSS_SELECTOR, 'input#search'), keywords)
-  while not 'www.youtube.com/results' in driver.current_url:
+  for _ in range(20):
     if random.randrange(2):
       search_bar.send_keys(Keys.ENTER)
     else:
@@ -622,6 +628,8 @@ def yt_search(driver, keywords):
         driver.find_element(By.XPATH, '//*[@id="search-icon-legacy"]').click()
       except Exception:
         driver.execute_script('document.querySelector("#search-icon-legacy").click()')
+    if 'www.youtube.com/results' in driver.current_url:
+      break
   finder = make_video_finder(lambda title: (By.XPATH, f'//*[@title="{title}"]'))
   for i in range(10):
     try:
@@ -657,15 +665,15 @@ class Video:
     self.fake_watch = fake_watch
     self.routes = []
     for type, arr in info['routes'].items():
-      self.routes += [(type, data) for data in arr ] * (search_boost if 'search' in type else 1)
+      self.routes += [(type, data) for data in arr ] * (search_preference if 'search' in type else 1)
     for link in get_fallback_links(self.id):
       self.routes.append(('url', link))
       #self.routes.append(('url', GOOGLE_LINK_TEMPLATE.format(url=link)))
   def open(self, identifier, driver):
     while True:
       route = random.choice(self.routes)
-      if 'search' in route[0]:
-        try:
+      try:
+        if 'search' in route[0]:
           if route[0] == 'bing_search':
             result = bing_search(driver, route[1])
           elif route[0] == 'duck_search':
@@ -679,30 +687,25 @@ class Video:
             bypass_consent(driver)
             videos.add_route_record(route[0], RouteRecord.SUCCESS, route[1])
             return
-        except Exception as e:
-          if isinstance(e, LoadingError):
-            videos.add_route_record(route[0], RouteRecord.CONNECTION_FAILURE)
-            raise e
-          else:
-            videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
-            error_log('html', identifier + f"Error during {route[0]}: {traceback.format_exc()}")
-        else:
           error_log('html', identifier + f"{route[0]} failed: {route[1]} :::: {self.title}. Fallback to url")
           videos.add_route_record(route[0], RouteRecord.DATA_FAILURE, route[1])
-        continue
-      if route[0] == 'url':
-        try:
+        elif route[0] == 'url':
           spoof_referer(driver, random.choice(REFERERS), route[1])
           bypass_unsupported_browser(driver)
           wait_for_video(driver)
           bypass_consent(driver)
           videos.add_route_record(route[0], RouteRecord.SUCCESS, route[1])
           return
-        except Exception as e:
-          videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
+        else:
+          raise Exception("Invalid route type: " + route[0])
+      except Exception as e:
+        if isinstance(e, LoadingError):
+          videos.add_route_record(route[0], RouteRecord.CONNECTION_FAILURE)
           raise e
-      else:
-        raise Exception("Invalid route type: " + route[0])
+        else:
+          take_screenshot(driver)
+          videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
+          error_log('html', identifier + f"Error during {route[0]}: {traceback.format_exc()}")
 
 class Videos:
   def __init__(self):
@@ -720,7 +723,7 @@ class Videos:
     print(colors.OKGREEN[0] + f'{len(targeted_videos)} videos loaded' + colors.ENDC)
     if os.path.isfile('fake_watch_videos.json'):
       with open('fake_watch_videos.json', 'r', encoding='utf-8') as fp:
-        all_videos = targeted_videos + [Video(id, info, True) for id, info in json.load(fp).items()]*jumping_video_boost
+        all_videos = targeted_videos + [Video(id, info, True) for id, info in json.load(fp).items()]*jumping_video_preference
     else:
       all_videos = targeted_videos
     return targeted_videos, all_videos
@@ -750,15 +753,25 @@ class Videos:
 ################ BYPASSES ################
 
 accept_texts = ("j'accepte", "i agree", "jag godkänner", "ich stimme zu", "acepto", "accepto", "accetto", "aceito", "ak stem in", "jeg accepterer", "nõustun", "souhlasím", "ik ga akkoord", "принимаю", "saya setuju", "hyväksyn", "ຂ້າພະເຈົ້າຍອມຮັບ", "我同意")
+accept_texts_lower = ''.join(set(''.join(accept_texts).lower()) - {"'", '"'})
+accept_texts_upper = accept_texts_lower.upper()
 def bypass_consent(driver):
-  for _ in range(50):
+  for i in range(50):
     try:
-      consent = driver.find_element(By.XPATH, "//*[lower-case(.)={accept_texts}]")
+      for text in accept_texts:
+        consent = driver.find_elements(By.XPATH, f'//*[translate(., "{accept_texts_upper}", "{accept_texts_lower}")="{text}"]')
+        if consent:
+          consent = consent[0]
+          break
+      else:
+        return i
       driver.execute_script("arguments[0].scrollIntoView();", consent)
       time.sleep(random.uniform(0.5, 1))
       consent.click()
-    except (selenium.common.exceptions.NoSuchElementException, selenium.common.exceptions.ElementNotVisibleException):
-      break
+    except (selenium.common.exceptions.ElementNotVisibleException, selenium.common.exceptions.ElementNotInteractableException):
+      traceback.print_exc()
+      print(i)
+      return i
   else:
     raise Exception("Consent form still visible after 50 tries")
 
@@ -823,8 +836,8 @@ def check_title(driver):
     for alt in video.alt_titles:
       if alt in driver.title: return True
 
-def play_video(driver):
-  if not check_title(driver):
+def play_video(driver, check=True):
+  if check and not check_title(driver):
     raise Exception(f"Watching wrong video: {driver.title}")
   try:
     try:
@@ -836,14 +849,10 @@ def play_video(driver):
     try:
       driver.find_element_by_css_selector(By.CSS_SELECTOR, '[title^="Play (k)"]').click()
     except Exception:
-      try:
-        driver.execute_script(
-          "document.querySelector('button.ytp-play-button.ytp-button').click()")
-      except Exception:
-        pass
+      pass
 
-def play_music(driver, title):
-  if not check_title(driver):
+def play_music(driver, check=True):
+  if check and not check_title(driver):
     raise Exception(f"Watching wrong video: {driver.title}")
   try:
     try:
@@ -863,13 +872,13 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
   skip_stuff(identifier, driver)
   if "music.youtube.com" in driver.current_url:
     content_type = 'Music'
-    play_music(driver, title)
+    play_music(driver, False)
     view_stat = 'Music'
   else:
     content_type = 'Video'
-    play_video(driver)
-    if bandwidth:
-      save_bandwidth(driver)
+    play_video(driver, False)
+    if save_bandwidth:
+      reduce_bandwidth(driver)
     change_playback_speed(driver)
     view_stat = WebDriverWait(driver, 30).until(EC.visibility_of_element_located(
       (By.XPATH, '//span[@class="view-count style-scope ytd-video-view-count-renderer"]'))).text
@@ -936,7 +945,7 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
   cooldowns.add(cooldown_url, WATCH_COOLDOWN)
 
 available_qualities = ('360p', '480p', '720p', '1080p')
-def save_bandwidth(driver):
+def reduce_bandwidth(driver):
   try:
     driver.find_element(By.CSS_SELECTOR, "button.ytp-button.ytp-settings-button").click()
     driver.find_element(By.XPATH, "//span[text()={available_qualities}]").click()
@@ -957,6 +966,7 @@ def change_playback_speed(driver):
   elif playback_speed == 3:
     driver.find_element(By.ID, 'movie_player').send_keys('>'*(random.randrange(3) + 1))
 
+#COMMANDS = [Keys.UP, Keys.DOWN, 'k', 'j', 'l', 't', 'c']
 COMMANDS = [Keys.UP, Keys.DOWN, 'k', 'j', 'l', 't', 'c']
 def random_command(identifier, driver):
   try:
@@ -968,20 +978,22 @@ def random_command(identifier, driver):
       command = random.choice(COMMANDS)
       if command in {'m', 't', 'c'}:
         movie_player.send_keys(command)
-      elif command == 'k':
-        press = random.randrange(2)
-        if press:
-          movie_player.send_keys(command)
-        for _ in range(2, 5):
-          driver.execute_script(f'window.scrollBy(0, {random.uniform(300, 700)});')
-          time.sleep(random.uniform(0.5, 3))
-        driver.execute_script("arguments[0].scrollIntoView();", movie_player)
-        if press:
-          movie_player.send_keys(command)
+      #elif command == 'k':
+      #  press = random.randrange(2)
+      #  if press:
+      #    movie_player.send_keys(command)
+      #  for _ in range(2, 5):
+      #    driver.execute_script(f'window.scrollBy(0, {random.uniform(300, 700)});')
+      #    time.sleep(random.uniform(0.5, 3))
+      #  driver.execute_script("arguments[0].scrollIntoView();", movie_player)
+      #  if press:
+      #    movie_player.send_keys(command)
       else:
         movie_player.send_keys(command*(random.randrange(5)+1))
   except Exception:
-    error_log('html', identifier + f"Random command error: {traceback.format_exc()}")
+    if not bypass_consent(driver):
+      take_screenshot(driver)
+      error_log('html', identifier + f"Random command error: {traceback.format_exc()}")
 
 ################ VIEW THREAD ################
 
@@ -1020,10 +1032,12 @@ def view_thread(identifier, proxy):
       error_log(log_regular_errors, identifier + f"{type(e).__name__}! Slow internet or stuck at recaptcha")
       return
     except selenium.common.exceptions.WebDriverException:
+      take_screenshot(driver)
       cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
       error_log(log_regular_errors, identifier + f"WebDriverException: {traceback.format_exc()}")
       return
     except Exception:
+      take_screenshot(driver)
       error_log('html', identifier + f"Watch loop exception : {traceback.format_exc()}")
     finally:
       quit_driver(driver)
@@ -1039,8 +1053,9 @@ def view_thread(identifier, proxy):
 def print_view_records():
   print(f'Views: {views.value - og_views}')
   print(f'Hours: {watch_time.value - og_watch_time}')
+  print(f'Watch hour / real hour = {(watch_time.value - og_watch_time)/(time.time() - start_time)*3600}')
 def print_route_records():
-  print('S: success, C: connection failure, F: other failure')
+  print(f'{colors.OKGREEN[0]}S: success, {colors.WARNING[0]}C: connection failure, {colors.FAIL[0]}F: other failure{colors.ENDC}')
   if videos.route_records:
     for type, record in list(videos.route_records.items()):
       print(f'{type}: {record}')
@@ -1114,7 +1129,7 @@ def main():
     thread.start()
     return thread
   add_thread("Database udpate", update_database)
-  webserver_thread = api and add_thread("Web server", website.start_server, host, port)
+  webserver_thread = web_interface and add_thread("Web server", website.start_server, host, port)
   for _ in range(proxy_thread_count):
     add_thread("Proxy checker", proxies.check_proxies)
   try:
@@ -1131,7 +1146,7 @@ def main():
       print()
       print("Stopping subprocesses... please wait")
       if webserver_thread and webserver_thread.is_alive():
-        requests.post(f'http://127.0.0.1:{port}/shutdown')
+        requests.post(f'http://{host}:{port}/shutdown')
       for driver in driver_list:
         driver.quit()
     except Exception:
@@ -1150,24 +1165,43 @@ if __name__ == '__main__':
   else:
     useragents = fake_useragent.UserAgent()
 
-  if not os.path.isfile('config.json'):
-    create_config()
+  default_settings = {
+    "web_interface": {
+      "enabled": True,
+      "host": "0.0.0.0",
+      "port": 5000
+    },
+    "headless": False,
+    "firefox_path": None,
+    "filter_anonymity": None,
+    "minimum_percent": 70.0,
+    "maximum_percent": 90.0,
+    "save_bandwidth": True,
+    "playback_speed": 1,
+    "proxy_thread_count": 40,
+    "browser_per_video_player": 3,
+    "video_player_count": 5,
+    "max_browsers": 15,
+    "jumping_video_preference": 1,
+    "search_preference": 2
+  }
+  #if not os.path.isfile('config.json'):
+  #  create_config()
   with open('config.json', 'r') as openfile:
     config = json.load(openfile)
+  config = {**default_settings, **config}
 
-  jumping_video_boost = config.get("jumping_video_boost", 1)
-  api = config["http_api"]["enabled"]
-  host = config["http_api"]["host"]
-  port = config["http_api"]["port"]
-  database = config["database"]
-  search_boost = config["search_boost"]
+  web_interface = config["web_interface"]["enabled"]
+  host = config["web_interface"]["host"]
+  port = config["web_interface"]["port"]
+  jumping_video_preference = config.get("jumping_video_preference", 1)
+  search_preference = config["search_preference"]
   headless = config["headless"]
   filter_anonymity = config["filter_anonymity"]
   firefox_path = config["firefox_path"]
   minimum = config["minimum_percent"] / 100
   maximum = config["maximum_percent"] / 100
-  background = config["background"]
-  bandwidth = config["bandwidth"]
+  save_bandwidth = config["save_bandwidth"]
   playback_speed = config["playback_speed"]
   proxy_thread_count = config["proxy_thread_count"]
   browser_ratio = config["browser_per_video_player"]
