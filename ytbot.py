@@ -540,7 +540,7 @@ def make_video_finder(formatter, *popups):
     for matcher, video in video_matchers:
       try:
         video_element = driver.find_element(*matcher)
-        if not video_element.displayed() or not video_element.enabled():
+        if not video_element.is_displayed() or not video_element.is_enabled():
           continue
       except selenium.common.exceptions.NoSuchElementException:
         continue
@@ -1063,8 +1063,8 @@ def print_view_records():
   print(f'Hours: {watch_time.value - og_watch_time}')
   print(f'Watch hour / real hour = {(watch_time.value - og_watch_time)/(time.time() - start_time)*3600}')
 def print_route_records():
-  print(f'{colors.OKGREEN[0]}S: success, {colors.WARNING[0]}C: connection failure, {colors.FAIL[0]}F: other failure{colors.ENDC}')
   if videos.route_records:
+    print(f'{colors.OKGREEN[0]}S: success, {colors.WARNING[0]}C: connection failure, {colors.FAIL[0]}F: other failure{colors.ENDC}')
     for type, record in list(videos.route_records.items()):
       print(f'{type}: {record}')
   else:
