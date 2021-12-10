@@ -16,26 +16,27 @@ import time
 import random
 import datetime
 import base64
-import proxy_checker
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import website
+import proxy_scraper
+import proxy_checker
 
 detailed_proxy_errors = True
 log_reached_limit = False
-log_proxy_events = 'console'
-log_regular_events = 'console'
-log_regular_errors = 'console'
+log_proxy_events = 'temp'
+log_regular_events = 'temp'
+log_regular_errors = 'temp'
 
 OVER_LIMIT_SLEEP_UNIT = 4
 
 STAT_DATABASE = 'stats.db'
 COOLDOWN_DATABASE = 'proxy_cooldowns.db'
 
-VIEWPORT = ['2560x1440', '1920x1080', '1440x900', '1536x864', '1366x768', '1280x1024', '1024x768']
+VIEWPORT = ['2560x1440', '1920x1080', '1920x1080', '1440x900', '1536x864', '1366x768', '1280x1024']
 SEARCH_ENGINES = ['https://search.yahoo.com/', 'https://duckduckgo.com/', 'https://www.google.com/', 'https://www.bing.com/', '', '']
 REFERERS = SEARCH_ENGINES + ['https://t.co/']
 GOOGLE_LINK_TEMPLATE = "https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=video&cd=&url={url}"
@@ -59,8 +60,8 @@ class colors:
   OKGREEN = ('\033[92m', "#23d18b")
   WARNING = ('\033[93m', "#ffff00")
   FAIL = ('\033[91m', "#f14c4c")
-  NONE = ('', "#ffffff")
   ENDC = '\033[0m'
+  NONE = (ENDC, "#ffffff")
 
 class AtomicCounter:
   def __init__(self, initial=0):
@@ -113,9 +114,12 @@ def first_action_wrap(driver, condition):
 def combined_log(level, *text_tups):
   if level and not terminated:
     timestamp = datetime.datetime.now().strftime("[%d-%b-%Y %H:%M:%S] ")
-    text_tups = [(colors.NONE, timestamp), *text_tups]
+    text_tups = [timestamp, *text_tups]
+    text_tups = [(colors.NONE, tup) if isinstance(tup, str) else tup for tup in text_tups]
     print(''.join([color[0] + msg for color, msg in text_tups]) + colors.ENDC)
-    if web_interface and level == 'html':
+    if web_interface and level == 'persist':
+      if log_file:
+        log_file.write(''.join([msg for _, msg in text_tups]) + '\n')
       if len(website.console) > 50:
         website.console.pop(0)
       html = ''.join([f'<span style="color:{key[1]}"> {value} </span>' for key, value in text_tups])
@@ -177,7 +181,7 @@ def update_database():
         cooldowns.commit()
         videos.detect_changes()
       except Exception:
-        error_log('html', f"Database update error: {traceback.format_exc()}")
+        error_log('persist', f"Database update error: {traceback.format_exc()}")
       if terminated:
         break
   finally:
@@ -189,6 +193,9 @@ def update_database():
 COOLDOWN_PER_HOUR = 1
 COOLDOWN_THRESHOLD = 2
 MIN_COOLDOWN = 0.1
+BAD_PROXY_COOLDOWN = 2
+SLOW_PROXY_COOLDOWN = 1
+BAD_ANON_COOLDOWN = 48
 WATCH_COOLDOWN = 12
 
 class CooldownEntry:
@@ -245,9 +252,6 @@ class Cooldowns:
 
 ################ PROXIES ################
 
-BAD_PROXY_COOLDOWN = 2
-SLOW_PROXY_COOLDOWN = 1
-BAD_ANON_COOLDOWN = 48
 PROXY_RESERVE = 4
 PROXY_CHECK_ORDER = {
   None: ['http', 'socks4', 'socks5'],
@@ -261,22 +265,10 @@ class ProxyInfo:
     self.url = url
 class Proxies:
   def __init__(self):
-    self._current_idx= 0
+    self._current_idx = 0
     self._idx_lock = threading.Lock()
     self.checker = proxy_checker.Checker()
-
-  def driver(self):
-    if self._driver:
-      return self._driver
-    service = selenium.webdriver.firefox.service.Service(log_path=get_null_path())
-    options = selenium.webdriver.FirefoxOptions()
-    options.accept_insecure_certs = True
-    options.headless = True
-    if firefox_path:
-      options.binary = firefox_path
-    self._driver = selenium.webdriver.Firefox(options=options, service=service)
-    driver_list.append(self._driver)
-    return self._driver
+    self.hash = None
 
   def next(self):
     with self._idx_lock:
@@ -286,19 +278,10 @@ class Proxies:
       self._current_idx = (self._current_idx + 1) % len(self._list)
       return idx, self._list[idx]
 
-  def refresh(self):
-    self._list = []
-    self._urls = set()
-    self._gather()
-    if os.path.isfile('proxies.pyx'):
-      with open('proxies.pyx', 'r') as openfile:
-        # pyx is for Python Expression
-        sources = eval(openfile.read())
-    else:
-      print(colors.FAIL[0] + "No proxies.pyx found!")
-    for source in list_wrap(sources):
-      self._load(source)
-    self._urls = None
+  def load(self):
+    proxy_scraper.load_proxies("proxy_list.txt")
+    self._list = [ProxyInfo(item[0], item[1]) for item in proxy_scraper.result]
+    proxy_scraper.clear()
     if not self._list:
       raise Exception("No proxies found!")
     random.shuffle(self._list)
@@ -316,59 +299,13 @@ class Proxies:
       COOLDOWN_THRESHOLD = float('inf')
     print(colors.OKCYAN[0] + f'Not blacklisted: {good_count}' + colors.ENDC)
 
-  def _load(self, source):
-    def add_list(url, type):
-      if not url in self._urls:
-        self._urls.add(url)
-        self._list.append(ProxyInfo(type, url))
-    extract_type = lambda source: source if isinstance(source, tuple) else (source, None)
-    if isinstance(source, dict):
-      if isinstance(source['regex'], str):
-        source['regex'] = re.compile(source['regex'], re.DOTALL)
-        if source['regex'].groups != 2:
-          raise Exception("Proxy regex must contain 2 groups (for host and port)")
-      for url in list_wrap(source['url']):
-        if isinstance(url, dict):
-          # Selenium doesn't support complicated requests, so we use requests
-          real_url, type = extract_type(url['url'])
-          response = requests.request(url.get('method', 'GET'), real_url,
-              data=url.get('data', None),
-              headers={"User-Agent": useragents.random})
-          if 'javascript' in url:
-            htmlb64 = base64.b64encode(response.text.encode('utf-8')).decode()
-            raw = self.driver().get('data:text/html;base64,' + htmlb64).page_source
-            self.driver().get('about:blank')
-          else:
-            raw = response.text
-        else:
-          url, type = extract_type(url)
-          raw = requests.get(url, headers={"User-Agent": useragents.random}).text
-        for host, port in source['regex'].findall(raw):
-          add_list(f'{host}:{port}', type)
-      return
-    source, type = extract_type(source)
-    def add_line(line):
-      if line:
-        if line.count(':') == 3:
-          split = line.split(':')
-          line = f'{split[2]}:{split[-1]}@{split[0]}:{split[1]}'
-        add_list(line, type)
-    if source.startswith('http://') or source.startswith('https://'):
-      lines = requests.get(source).text
-      for line in lines.split('\r\n' if '\r\n' in lines else '\n'):
-        add_line(line)
-    else:
-      with open(source, encoding="utf-8") as fh:
-        for line in fh:
-          add_line(line.strip())
+  def get_hash(self):
+    with open("proxy_list.txt", "rb") as f:
+      return hashlib.md5(f.read()).hexdigest()
 
-  def _gather(self):
-    self._load(('https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt', None))
-    self._load(('https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', 'http'))
-    self._load(('https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt', 'socks4'))
-    self._load(('https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt', 'socks5'))
-    self._load(('https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/proxy.txt', None))
-    self._load(('https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt', None))
+  def refresh(self):
+    if self.get_hash() != self.hash:
+      self.load()
 
   def check_proxies(self):
     while True:
@@ -393,7 +330,7 @@ class Proxies:
       if not proxy.type:
         proxy.type = result.protocols.pop()
       elif not proxy.type in result.protocols:
-        error_log('html', identifier + f"{proxy.type} --> Wrong protocol, actually {result.protocols}")
+        error_log('persist', identifier + f"{proxy.type} --> Wrong protocol, actually {result.protocols}")
         proxy.type = result.protocols.pop()
       combined_log(log_proxy_events, (colors.OKGREEN, identifier + f"{proxy.type} --> Good Proxy"))
       if terminated: return
@@ -487,18 +424,21 @@ class RouteRecord:
     self.type_failures = [0, 0, 0]
     self.data_failures = {}
     self.add_record(first_record_type, first_data)
-  def __str__(self):
+  def repr_tups(self):
     def format_record(record):
       msg = []
       if record[self.SUCCESS]:
-        msg.append(colors.OKGREEN[0] + f'S{record[self.SUCCESS]}')
+        msg.append((colors.OKGREEN, f'S{record[self.SUCCESS]}'))
       if record[self.CONNECTION_FAILURE]:
-        msg.append(colors.WARNING[0] + f'C{record[self.CONNECTION_FAILURE]}')
+        msg.append((colors.WARNING, f'C{record[self.CONNECTION_FAILURE]}'))
       if record[self.FAILURE]:
-        msg.append(colors.FAIL[0] + f'F{record[self.FAILURE]}')
-      return '-'.join(msg) + colors.ENDC
-    data_str = ''.join(f'\n  {data}: {format_record(ratio)}' for data, ratio in self.data_failures.items())
-    return f'RouteRecord({format_record(self.type_failures)}, {{{data_str}}})'
+        msg.append((colors.FAIL, f'F{record[self.FAILURE]}'))
+      return msg
+    result = ['Route record: ', *format_record(self.type_failures)]
+    for data, record in self.data_failures.items():
+      result.append(f'\n  {data}: ')
+      result += format_record(record)
+    return result
   def add_record(self, record_type, data=None):
     if record_type == self.TYPE_FAILURE:
       self.type_failures[self.FAILURE] += 1
@@ -689,7 +629,7 @@ class Video:
             bypass_consent(driver)
             videos.add_route_record(route[0], RouteRecord.SUCCESS, route[1])
             return
-          error_log('html', identifier + f"{route[0]} failed: {route[1]} :::: {self.title}. Fallback to url")
+          error_log('persist', identifier + f"{route[0]} failed: {route[1]} :::: {self.title}. Fallback to url")
           videos.add_route_record(route[0], RouteRecord.DATA_FAILURE, route[1])
         elif route[0] == 'url':
           spoof_referer(driver, random.choice(REFERERS), route[1])
@@ -707,7 +647,7 @@ class Video:
         else:
           take_screenshot(driver)
           videos.add_route_record(route[0], RouteRecord.TYPE_FAILURE)
-          error_log('html', identifier + f"Error during {route[0]}: {traceback.format_exc()}")
+          error_log('persist', identifier + f"Error during {route[0]}: {traceback.format_exc()}")
 
 class Videos:
   def __init__(self):
@@ -719,7 +659,7 @@ class Videos:
     with open('videos.json', 'r', encoding='utf-8') as fp:
       video_dict = json.load(fp)
     if not video_dict:
-      error_log("html", f"Your videos.json is empty!")
+      error_log('persist', f"Your videos.json is empty!")
       sys.exit()
     targeted_videos = [Video(id, info, False) for id, info in video_dict.items()]
     print(colors.OKGREEN[0] + f'{len(targeted_videos)} videos loaded' + colors.ENDC)
@@ -740,12 +680,12 @@ class Videos:
   def detect_changes(self):
     new_hash = self.get_hash()
     if new_hash != self.hash:
-      print("Reloading videos...")
+      combined_log('temp', "Reloading videos...")
       try:
         self.targeted_videos, self.all_videos = self.load()
         self.hash = new_hash
       except:
-        traceback.print_exc()
+        combined_log('persist', (colors.FAIL, traceback.format_exc()))
   def add_route_record(self, route_type, record_type, route_data=None):
     if not route_type in self.route_records:
       self.route_records[route_type] = RouteRecord(record_type, route_data)
@@ -771,7 +711,7 @@ def bypass_consent(driver):
       time.sleep(random.uniform(0.5, 1))
       consent.click()
     except (selenium.common.exceptions.ElementNotVisibleException, selenium.common.exceptions.ElementNotInteractableException) as e:
-      combined_log(log_regular_errors, (colors.OKBLUE, identifier + f"Bypass consent error: {repr(e)}"))
+      combined_log(log_regular_errors, f"Bypass consent error: {repr(e)}")
       return i
   else:
     raise Exception("Consent form still visible after 50 tries")
@@ -782,7 +722,7 @@ def bypass_unsupported_browser(driver):
     try:
       driver.find_element(By.CSS_SELECTOR, "a#return-to-youtube").click()
     except Exception:
-      traceback.print_exc()
+      combined_log('persist', (colors.FAIL, traceback.format_exc()))
     time.sleep(random.uniform(0.1, 1))
 
 def bypass_signin(driver):
@@ -820,16 +760,16 @@ def skip_stuff(identifier, driver):
     WebDriverWait(driver, 15).until(EC.element_to_be_clickable(
       (By.CLASS_NAME, "ytp-ad-preview-container")))
   except Exception:
-    combined_log(log_regular_events, (colors.OKBLUE, identifier + "No ads found"))
+    combined_log(log_regular_events, identifier + "No ads found")
   else:
     try:
-      combined_log(log_regular_events, (colors.OKBLUE, identifier + "Skipping Ads..."))
+      combined_log(log_regular_events, identifier + "Skipping Ads...")
       skip_button = WebDriverWait(driver, 20).until(EC.element_to_be_clickable(
           (By.CLASS_NAME, "ytp-ad-skip-button")))
       time.sleep(random.uniform(0.1, 5))
       skip_button.click()
     except Exception as e:
-      combined_log(log_regular_errors, (colors.OKBLUE, identifier + f"Ad skipping exception: {repr(e)}"))
+      combined_log(log_regular_errors, identifier + f"Ad skipping exception: {repr(e)}")
   bypass_other_popups(driver)
 
 ################ PLAYING ################
@@ -902,7 +842,7 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
       view_stat = driver.find_element(By.XPATH,
         '//span[@class="view-count style-scope ytd-video-view-count-renderer"]').text
       if 'watching' in view_stat:
-        combined_log(log_regular_events, (colors.OKGREEN, identifier + "Stream found, "), (colors.OKCYAN, f"{view_stat} "))
+        combined_log(log_regular_events, identifier + "Stream found, {view_stat} ")
       else:
         error += 1
       random_command(identifier, driver)
@@ -924,9 +864,9 @@ def play(identifier, cooldown_url, driver, title, fake_watch = False):
       video_len = video_len*random.uniform(minimum, maximum)
 
       duration = str(datetime.timedelta(seconds=video_len))
-      combined_log(log_regular_events, (colors.OKGREEN, identifier + f"{content_type} found, Watch Duration : {duration} "))
+      combined_log(log_regular_events, identifier + f"{content_type} found, Watch Duration : {duration} ")
     except Exception:
-      error_log('html', identifier + "Suppressed exception before playing: {traceback.format_exc()}")
+      error_log('persist', identifier + "Suppressed exception before playing: {traceback.format_exc()}")
 
     prev_time = 0
     for _ in range(round(video_len/2)):
@@ -1001,7 +941,7 @@ def random_command(identifier, driver):
   except Exception:
     if not bypass_consent(driver):
       take_screenshot(driver)
-      error_log('html', identifier + f"Random command error: {traceback.format_exc()}")
+      error_log('persist', identifier + f"Random command error: {traceback.format_exc()}")
 
 ################ VIEW THREAD ################
 
@@ -1021,20 +961,20 @@ def view_thread(identifier, proxy):
             for idx in range(random.randint(3, 5)):
               next = find_video_suggestion(driver)
               if not next:
-                error_log('html', identifier + f"Can't find a recommended video from {current.title}, opening a new one")
+                error_log('persist', identifier + f"Can't find a recommended video from {current.title}, opening a new one")
                 current = random.choice(videos.targeted_videos)
                 current.open(identifier, driver)
               else:
-                combined_log(log_regular_events, (colors.OKBLUE, identifier + f"Jumped '{current.title}' --> '{next.title}'"))
+                combined_log(log_regular_events, identifier + f"Jumped '{current.title}' --> '{next.title}'")
                 current = next
               play(identifier, proxy.url, driver, current.title, current.fake_watch)
           finally:
             video_player_count.increment(-1)
         else:
-          combined_log(log_reached_limit, (colors.OKBLUE, identifier + f"Reached video player limit"))
+          combined_log(log_reached_limit, identifier + f"Reached video player limit")
           time.sleep(over_limit_sleep)
           break
-      combined_log(log_regular_events, (colors.OKBLUE, identifier + "Closing video player"))
+      combined_log(log_regular_events, identifier + "Closing video player")
     except (FirstPageError, FirstActionError, LoadingError) as e:
       cooldowns.add(proxy.url, SLOW_PROXY_COOLDOWN)
       error_log(log_regular_errors, identifier + f"{type(e).__name__}! Slow internet or stuck at recaptcha")
@@ -1046,29 +986,32 @@ def view_thread(identifier, proxy):
       return
     except Exception:
       take_screenshot(driver)
-      error_log('html', identifier + f"Watch loop exception : {traceback.format_exc()}")
+      error_log('persist', identifier + f"Watch loop exception : {traceback.format_exc()}")
     finally:
       quit_driver(driver)
   except TerminatedError:
     print(f"{identifier}terminated")
   except Exception:
-    error_log('html', identifier + f"Main viewer : {traceback.format_exc()}")
+    error_log('persist', identifier + f"Main viewer : {traceback.format_exc()}")
   finally:
     browser_count.increment(-1)
 
 ################ COMMAND LINE ################
 
 def print_view_records():
-  print(f'Views: {views.value - og_views}')
-  print(f'Hours: {watch_time.value - og_watch_time}')
-  print(f'Watch hour / real hour = {(watch_time.value - og_watch_time)/(time.time() - start_time)*3600}')
+  combined_log('persist', f'Views: {views.value - og_views}')
+  watch_hours = watch_time.value - og_watch_time
+  ratio = watch_hours / (time.time() - start_time)*3600
+  combined_log('persist', f'Hours: {watch_hours}')
+  combined_log('persist', f'Watch hour / real hour = {ratio}')
+  combined_log('persist', f'Efficiency = {ratio / max_video_players}')
 def print_route_records():
   if videos.route_records:
-    print(f'{colors.OKGREEN[0]}S: success, {colors.WARNING[0]}C: connection failure, {colors.FAIL[0]}F: other failure{colors.ENDC}')
+    combined_log('persist', (colors.OKGREEN, 'S: success'), (colors.WARNING, 'C: connection failure'), (colors.FAIL, 'F: other failure'))
     for type, record in list(videos.route_records.items()):
-      print(f'{type}: {record}')
+      combined_log('persist', f'{type}: ', *record.repr_tups())
   else:
-    print('No Data')
+    combined_log('persist', 'No Data')
 
 def process_cmd(cmd):
   cmd = cmd.lower()
@@ -1128,7 +1071,7 @@ def main():
     try:
       func(*args)
     except Exception:
-      error_log('html', f"{msg} error: {traceback.format_exc()}")
+      error_log('persist', f"{msg} error: {traceback.format_exc()}")
     if terminated:
       print(f"{msg} exited")
 
@@ -1138,6 +1081,8 @@ def main():
     return thread
   add_thread("Database udpate", update_database)
   webserver_thread = web_interface and add_thread("Web server", website.start_server, host, port)
+  while not cooldowns:
+    time.sleep(0.1)
   for _ in range(proxy_thread_count):
     add_thread("Proxy checker", proxies.check_proxies)
   try:
@@ -1145,12 +1090,12 @@ def main():
       try:
         process_cmd(input())
       except Exception:
-        error_log('html', f"CLI error: {traceback.format_exc()}")
+        error_log('persist', f"CLI error: {traceback.format_exc()}")
   except KeyboardInterrupt:
     try:
-      terminated = True
       print_route_records()
       print_view_records()
+      terminated = True
       print()
       print("Stopping subprocesses... please wait")
       if webserver_thread and webserver_thread.is_alive():
@@ -1158,11 +1103,11 @@ def main():
       for driver in driver_list:
         driver.quit()
     except Exception:
-      traceback.print_exc()
+      combined_log('persist', (colors.FAIL, traceback.format_exc()))
     finally:
       sys.exit()
   except Exception:
-    traceback.print_exc()
+    combined_log('persist', (colors.FAIL, traceback.format_exc()))
 
 if __name__ == '__main__':
   for _ in range(9):
@@ -1191,7 +1136,8 @@ if __name__ == '__main__':
     "video_player_count": 5,
     "max_browsers": 15,
     "jumping_video_preference": 1,
-    "search_preference": 2
+    "search_preference": 2,
+    "log_file": "ytbot.log",
   }
   #if not os.path.isfile('config.json'):
   #  create_config()
@@ -1202,7 +1148,7 @@ if __name__ == '__main__':
   web_interface = config["web_interface"]["enabled"]
   host = config["web_interface"]["host"]
   port = config["web_interface"]["port"]
-  jumping_video_preference = config.get("jumping_video_preference", 1)
+  jumping_video_preference = config["jumping_video_preference"]
   search_preference = config["search_preference"]
   headless = config["headless"]
   filter_anonymity = config["filter_anonymity"]
@@ -1214,17 +1160,23 @@ if __name__ == '__main__':
   proxy_thread_count = config["proxy_thread_count"]
   browser_ratio = config["browser_per_video_player"]
   max_video_players = config["video_player_count"]
-  max_browsers = config.get("max_browsers", 20)
+  max_browsers = config["max_browsers"]
+  cooldowns = None
 
-  driver_list = []
-  recheck_proxy = True
-  over_limit_sleep = 10
-  browser_count = AtomicCounter()
-  video_player_count = AtomicCounter()
-  terminated = False
-  over_limit_sleep = proxy_thread_count*OVER_LIMIT_SLEEP_UNIT
+  log_file = open(config["log_file"], 'w') if config.get("log_file") else None
+  try:
+    driver_list = []
+    recheck_proxy = True
+    over_limit_sleep = 10
+    browser_count = AtomicCounter()
+    video_player_count = AtomicCounter()
+    terminated = False
+    over_limit_sleep = proxy_thread_count*OVER_LIMIT_SLEEP_UNIT
 
-  videos = Videos()
-  proxies = Proxies()
+    videos = Videos()
+    proxies = Proxies()
 
-  main()
+    main()
+  finally:
+    if log_file:
+      log_file.close()

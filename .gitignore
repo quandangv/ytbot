@@ -5,3 +5,4 @@ __pycache__/
 *.pyx
 *.log
 *.db
+*.txt
