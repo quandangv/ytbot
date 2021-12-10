@@ -94,7 +94,9 @@ class LoadingError(Exception): pass
 class FirstActionError(LoadingError): pass
 class FirstPageError(FirstActionError): pass
 class TerminatedError(Exception): pass
-
+class WrongVideoError(Exception):
+  def __init__(self, title):
+    self.msg = f"Watching wrong video: {title}"
 def first_page_wrap(driver, url):
   try:
     driver.get(url)
@@ -113,7 +115,7 @@ def first_action_wrap(driver, condition):
 
 def combined_log(level, *text_tups):
   if level and not terminated:
-    timestamp = datetime.datetime.now().strftime("[%d-%b-%Y %H:%M:%S] ")
+    timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
     text_tups = [timestamp, *text_tups]
     text_tups = [(colors.NONE, tup) if isinstance(tup, str) else tup for tup in text_tups]
     print(''.join([color[0] + msg for color, msg in text_tups]) + colors.ENDC)
@@ -782,7 +784,7 @@ def check_title(driver):
 
 def play_video(driver, check=True):
   if check and not check_title(driver):
-    raise Exception(f"Watching wrong video: {driver.title}")
+    raise WrongVideoError(driver.title)
   try:
     try:
       driver.find_element(By.CLASS_NAME, 'ytp-ad-skip-button').click()
@@ -951,14 +953,14 @@ def view_thread(identifier, proxy):
     combined_log(log_proxy_events, (colors.OKGREEN, identifier + "Opening a driver..."))
     driver = get_driver(useragents.random, proxy)
     try:
-      for _ in range(4):
+      for _ in range(6):
         current = random.choice(videos.all_videos)
         current.open(identifier, driver)
         if video_player_count.value < max_video_players:
           try:
             video_player_count.increment()
             play(identifier, proxy.url, driver, current.title, current.fake_watch)
-            for idx in range(random.randint(3, 5)):
+            for idx in range(random.randint(5, 8)):
               next = find_video_suggestion(driver)
               if not next:
                 error_log('persist', identifier + f"Can't find a recommended video from {current.title}, opening a new one")
@@ -968,6 +970,8 @@ def view_thread(identifier, proxy):
                 combined_log(log_regular_events, identifier + f"Jumped '{current.title}' --> '{next.title}'")
                 current = next
               play(identifier, proxy.url, driver, current.title, current.fake_watch)
+          except WrongVideoError as e:
+            error_log(log_regular_errors, identifier + e.msg)
           finally:
             video_player_count.increment(-1)
         else:
@@ -1007,7 +1011,7 @@ def print_view_records():
   combined_log('persist', f'Efficiency = {ratio / max_video_players}')
 def print_route_records():
   if videos.route_records:
-    combined_log('persist', (colors.OKGREEN, 'S: success'), (colors.WARNING, 'C: connection failure'), (colors.FAIL, 'F: other failure'))
+    combined_log('persist', (colors.OKGREEN, 'S: success, '), (colors.WARNING, 'C: connection failure, '), (colors.FAIL, 'F: other failure'))
     for type, record in list(videos.route_records.items()):
       combined_log('persist', f'{type}: ', *record.repr_tups())
   else:
